@@ -675,6 +675,116 @@ textarea {
     margin-bottom: 24px;
 }
 
+.promo-hunt-view {
+    display: flex;
+    flex-direction: column;
+    gap: 22px;
+    margin-bottom: 30px;
+}
+
+.promo-hunt-hero {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 24px;
+    padding: 26px;
+    border: 1px solid rgba(8, 44, 104, 0.12);
+    border-radius: 24px;
+    background: radial-gradient(circle at top right, rgba(255, 173, 51, 0.24), transparent 34%),
+        linear-gradient(135deg, #fff8f0 0%, #f7fbff 58%, #edf5ff 100%);
+    box-shadow: 0 16px 34px rgba(8, 44, 104, 0.08);
+}
+
+.promo-hunt-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 18px;
+}
+
+.promo-hunt-card {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    min-height: 320px;
+    padding: 20px;
+    border: 1px solid rgba(8, 44, 104, 0.12);
+    border-radius: 22px;
+    background: #fff;
+    box-shadow: 0 16px 30px rgba(8, 44, 104, 0.08);
+}
+
+.promo-hunt-card.exhausted {
+    opacity: 0.62;
+    filter: grayscale(0.2);
+}
+
+.promo-hunt-card.claimed {
+    border-color: rgba(31, 139, 76, 0.28);
+    background: linear-gradient(180deg, #ffffff 0%, #f4fbf7 100%);
+}
+
+.promo-hunt-card-head,
+.promo-hunt-progress {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.promo-hunt-badge {
+    display: inline-flex;
+    align-items: center;
+    min-height: 34px;
+    padding: 8px 12px;
+    border-radius: 999px;
+    color: #fff;
+    background: linear-gradient(135deg, #d9382a 0%, #f28b22 100%);
+    font-size: 13px;
+    font-weight: 900;
+    letter-spacing: 0.04em;
+}
+
+.promo-hunt-card h3 {
+    color: var(--primary);
+    font-size: 20px;
+    line-height: 1.25;
+}
+
+.promo-hunt-discount {
+    color: var(--accent);
+    font-size: 18px;
+    font-weight: 900;
+}
+
+.promo-hunt-note,
+.promo-hunt-reason {
+    color: var(--muted);
+    font-size: 14px;
+    line-height: 1.55;
+}
+
+.promo-hunt-note strong {
+    color: var(--primary);
+}
+
+.promo-hunt-progress {
+    margin-top: auto;
+    padding-top: 10px;
+    border-top: 1px dashed rgba(8, 44, 104, 0.16);
+    color: var(--muted);
+    font-size: 14px;
+}
+
+.promo-hunt-progress strong {
+    color: var(--primary);
+}
+
+.promo-hunt-manager-list {
+    display: grid;
+    gap: 10px;
+    margin-top: 14px;
+}
+
 .collection-breadcrumb {
     margin-bottom: 16px;
     color: var(--muted);
@@ -1114,6 +1224,7 @@ textarea {
     }
 
     .home-feature-strip,
+    .promo-hunt-grid,
     .home-personalized-filters {
         grid-template-columns: repeat(2, minmax(0, 1fr));
     }
@@ -1138,8 +1249,13 @@ textarea {
 
     .home-sale-track,
     .home-feature-strip,
+    .promo-hunt-grid,
     .home-personalized-filters {
         grid-template-columns: 1fr;
+    }
+
+    .promo-hunt-hero {
+        flex-direction: column;
     }
 
     .home-sale-card-image {
@@ -2902,16 +3018,18 @@ textarea {
 }
 
 .user-dropdown {
-    position: absolute;
-    top: calc(100% + 12px);
-    right: 0;
-    width: min(280px, calc(100vw - 32px));
+    position: fixed;
+    top: 86px;
+    right: clamp(12px, 2vw, 32px);
+    width: min(320px, calc(100vw - 24px));
     max-width: calc(100vw - 32px);
+    max-height: calc(100dvh - 104px);
+    overflow-y: auto;
     padding: 16px 0;
     border-radius: 16px;
     background: #fff;
     box-shadow: 0 16px 36px rgba(9, 26, 63, 0.18);
-    z-index: 125;
+    z-index: 240;
 }
 
 .dropdown-header {
@@ -2954,6 +3072,14 @@ textarea {
 .dropdown-list li i {
     width: 16px;
     color: var(--primary);
+}
+
+@media (max-width: 992px) {
+    .user-dropdown {
+        top: 72px;
+        right: 12px;
+        left: auto;
+    }
 }
 
 #admin-panel {
@@ -4749,6 +4875,7 @@ textarea {
 .brand-card,
 .collection-shortcut,
 .home-feature-box,
+.promo-hunt-card,
 .voucher-card {
     transition: transform var(--motion-medium) var(--ease-standard),
         box-shadow var(--motion-medium) var(--ease-standard),
@@ -4759,6 +4886,7 @@ textarea {
 .mega-section-card:hover,
 .collection-shortcut:hover,
 .home-feature-box:hover,
+.promo-hunt-card:hover,
 .voucher-card:hover {
     transform: translateY(-3px);
     box-shadow: 0 18px 34px rgba(8, 44, 104, 0.12);

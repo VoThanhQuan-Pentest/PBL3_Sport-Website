@@ -24,7 +24,12 @@ document.addEventListener('DOMContentLoaded', () => {
     const MANAGED_VOUCHERS_VERSION = '2026-04-30-category-expiry-v1';
     const VOUCHER_ASSIGNMENTS_KEY = 'pbl3_voucher_assignments';
     const VOUCHER_ASSIGNMENTS_VERSION_KEY = 'pbl3_voucher_assignments_version';
-    const VOUCHER_ASSIGNMENTS_VERSION = '2026-04-30-account-vouchers-v1';
+    const VOUCHER_ASSIGNMENTS_VERSION = '2026-05-07-account-voucher-quantity-v1';
+    const DEFAULT_VOUCHER_ASSIGNMENT_QUANTITY = 1;
+    const PROMO_HUNT_KEY = 'pbl3_promo_hunt_campaigns';
+    const PROMO_HUNT_CLAIMS_KEY = 'pbl3_promo_hunt_claims';
+    const PROMO_HUNT_VERSION_KEY = 'pbl3_promo_hunt_version';
+    const PROMO_HUNT_VERSION = '2026-05-07-promo-hunt-v1';
     const AVAILABLE_VOUCHERS = [
         {
             code: 'HOTDEAL10',
@@ -400,6 +405,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const productContainer = document.getElementById('product-container');
     const navCollectionLinks = Array.from(document.querySelectorAll('#nav a[data-collection]'));
+    const promoHuntLink = document.getElementById('promo-hunt-link');
     const searchBox = document.getElementById('search_box');
     const searchInput = document.getElementById('search-input');
     const searchSubmitButton = searchBox?.querySelector('button') || null;
@@ -431,6 +437,9 @@ document.addEventListener('DOMContentLoaded', () => {
     const collectionTitle = document.getElementById('collection-title');
     const collectionDescription = document.getElementById('collection-description');
     const collectionCount = document.getElementById('collection-count');
+    const promoHuntView = document.getElementById('promo-hunt-view');
+    const promoHuntGrid = document.getElementById('promo-hunt-grid');
+    const promoHuntCount = document.getElementById('promo-hunt-count');
     const homeSaleShowcase = document.getElementById('home-sale-showcase');
     const homeSaleTrack = document.getElementById('home-sale-track');
     const homeSaleDots = document.getElementById('home-sale-dots');
@@ -654,6 +663,9 @@ document.addEventListener('DOMContentLoaded', () => {
     let pendingRegisterPayload = null;
     let analyticsSessionId = ensureAnalyticsSessionId();
     let currentUser = normalizeUserProfile(readStorage(USER_KEY));
+    let promoHuntSyncPromise = null;
+    let promoHuntBackendAvailable = true;
+    let promoHuntManagerSyncedAt = 0;
     let allProducts = [];
     let currentCollectionId = '';
     let currentCategory = 'all';
@@ -942,6 +954,30 @@ document.addEventListener('DOMContentLoaded', () => {
                 applyCollectionFilter(link.dataset.collection);
                 closeMegaMenu();
             });
+        });
+
+        promoHuntLink?.addEventListener('click', event => {
+            event.preventDefault();
+            openPromoHuntView();
+        });
+
+        promoHuntView?.addEventListener('click', event => {
+            const claimButton = event.target.closest('[data-promo-hunt-claim]');
+            if (!claimButton || claimButton.disabled) {
+                return;
+            }
+            void claimPromoHuntCampaign(claimButton.dataset.promoHuntClaim);
+        });
+
+        window.addEventListener('storage', event => {
+            if (![PROMO_HUNT_KEY, PROMO_HUNT_CLAIMS_KEY, VOUCHER_ASSIGNMENTS_KEY].includes(event.key)) {
+                return;
+            }
+            if (currentView === 'promo-hunt') {
+                renderPromoHuntView();
+            }
+            renderCartView();
+            renderCheckoutView();
         });
 
         searchInput.addEventListener('input', () => {
@@ -3571,6 +3607,7 @@ document.addEventListener('DOMContentLoaded', () => {
         navCollectionLinks.forEach(link => {
             link.classList.toggle('active', link.dataset.collection === currentCollectionId);
         });
+        promoHuntLink?.classList.toggle('active', currentView === 'promo-hunt');
     }
 
     function getMegaMenuSummary() {
@@ -5376,8 +5413,11 @@ document.addEventListener('DOMContentLoaded', () => {
             addressCitySelect?.selectedOptions?.[0]?.textContent
         ].filter(Boolean).join(' '));
         const wardText = normalizeText(wardName);
+        if (!provinceText || !wardText) {
+            return [];
+        }
+
         const matchedByWard = [];
-        const matchedByProvince = [];
 
         ADDRESS_STREET_RULES.forEach(rule => {
             const matchesProvince = (rule.provinces || []).some(name => provinceText.includes(normalizeText(name)));
@@ -5391,13 +5431,10 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (matchesWard) {
                     matchedByWard.push(...ruleStreets);
                 }
-                return;
             }
-
-            matchedByProvince.push(...ruleStreets);
         });
 
-        return Array.from(new Set([...matchedByWard, ...matchedByProvince]))
+        return Array.from(new Set(matchedByWard))
             .sort((left, right) => left.localeCompare(right, 'vi'));
     }
 
@@ -5431,12 +5468,22 @@ document.addEventListener('DOMContentLoaded', () => {
         const streetOptions = getStreetOptionsForAddress(selectedProvince, wardName);
         const selectedStreet = String(address?.street || '').trim()
             || inferStreetFromAddressLine(address?.line || '', streetOptions);
-        const finalStreetOptions = selectedStreet && !streetOptions.some(street => normalizeText(street) === normalizeText(selectedStreet))
-            ? [selectedStreet, ...streetOptions]
-            : streetOptions;
+        const finalStreetOptions = streetOptions;
 
-        if (!selectedProvince || !wardName || !finalStreetOptions.length) {
-            setSelectOptions(addressStreetSelect, [], 'Chọn tỉnh/phường trước', '');
+        if (!selectedProvince) {
+            setSelectOptions(addressStreetSelect, [], 'Chọn tỉnh/thành phố trước', '');
+            addressStreetSelect.disabled = true;
+            return;
+        }
+
+        if (!wardName) {
+            setSelectOptions(addressStreetSelect, [], 'Chọn phường/xã trước', '');
+            addressStreetSelect.disabled = true;
+            return;
+        }
+
+        if (!finalStreetOptions.length) {
+            setSelectOptions(addressStreetSelect, [], 'Chưa có dữ liệu đường cho phường/xã này', '');
             addressStreetSelect.disabled = true;
             return;
         }
@@ -7078,14 +7125,30 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function toggleCartLineSelection(lineId, checked) {
         const cartItems = getCartItems();
-        const targetItem = cartItems.find(item => item.lineId === lineId);
+        const targetItem = cartItems.find(item => {
+            if (item.lineId === lineId) {
+                return true;
+            }
+
+            const product = findProductById(item.productId);
+            const sizeOptions = getProductSizeOptions(product);
+            const typeOptions = getProductTypeOptions(product);
+            const resolvedSize = sizeOptions.includes(item.size) ? item.size : (sizeOptions[0] || 'Tieu chuan');
+            const resolvedVariantType = typeOptions.length
+                ? (typeOptions.includes(item.variantType) ? item.variantType : (item.variantType || typeOptions[0]))
+                : '';
+            return buildCartLineId(item.productId, resolvedSize, resolvedVariantType) === lineId;
+        });
         if (!targetItem) {
             return;
         }
 
-        targetItem.selected = checked;
+        targetItem.selected = Boolean(checked);
         saveCartItems(cartItems);
         renderCartView();
+        if (currentView === 'checkout') {
+            renderCheckoutView();
+        }
     }
 
     function removeSelectedCartItems() {
@@ -7155,7 +7218,7 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
-        const remainingItems = getCartItems().filter(item => !item.selected);
+        const remainingItems = getCartItems().filter(item => !normalizeCartSelectionFlag(item.selected));
         saveCartItems(remainingItems);
         saveAppliedVoucherCode('');
         renderCartView();
@@ -7217,6 +7280,12 @@ document.addEventListener('DOMContentLoaded', () => {
         const districtValue = String(addressDistrictSelect?.value || '').trim();
         const houseNumber = String(addressHouseNumberInput?.value || '').trim();
         const street = String(addressStreetSelect?.value || '').trim();
+        if (addressStreetSelect?.disabled) {
+            addressFormError.textContent = 'Phường/xã đang chọn chưa có dữ liệu tên đường hợp lệ. Hãy chọn phường/xã khác hoặc bổ sung dữ liệu đường phố.';
+            addressFormError.classList.remove('hidden');
+            return;
+        }
+
         const addressLine = buildAddressLine(houseNumber, street);
         const nextAddress = {
             id: addressId || generateRecordId('address'),
@@ -7632,7 +7701,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const existingOrders = getOrderHistory();
         saveOrderHistory([nextOrder, ...existingOrders]);
 
-        const remainingItems = getCartItems().filter(item => !item.selected);
+        const remainingItems = getCartItems().filter(item => !normalizeCartSelectionFlag(item.selected));
         saveCartItems(remainingItems);
         saveAppliedVoucherCode('');
         renderCartView();
@@ -8002,7 +8071,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const existingOrders = getOrderHistory();
         saveOrderHistory([nextOrder, ...existingOrders]);
 
-        const remainingItems = getCartItems().filter(item => !item.selected);
+        const remainingItems = getCartItems().filter(item => !normalizeCartSelectionFlag(item.selected));
         saveCartItems(remainingItems);
         saveAppliedVoucherCode('');
         renderCartView();
@@ -8317,7 +8386,24 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function canAccessWorkspace(user = currentUser) {
-        return isStaffWorkspaceUser(user) || isManagerWorkspaceUser(user);
+        if (isStaffWorkspaceUser(user) || isManagerWorkspaceUser(user)) {
+            return true;
+        }
+
+        const identity = normalizeText([
+            user?.id,
+            user?.username,
+            user?.ten_dang_nhap,
+            user?.tenDangNhap,
+            user?.email
+        ].filter(Boolean).join(' '));
+
+        return identity.includes('user admin')
+            || identity.includes('user staff')
+            || identity === 'admin'
+            || identity.startsWith('admin ')
+            || identity.includes(' nhanvien')
+            || identity.includes(' staff');
     }
 
     function getWorkspaceRoleType(user = currentUser) {
@@ -8866,23 +8952,100 @@ document.addEventListener('DOMContentLoaded', () => {
         return fullName || username || 'Khách hàng';
     }
 
+    function getVoucherAssignmentQuantity(value) {
+        const parsed = Math.floor(Number(value));
+        return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_VOUCHER_ASSIGNMENT_QUANTITY;
+    }
+
+    function normalizeVoucherAssignmentGrant(grant = {}, fallbackCode = '') {
+        const isObject = grant && typeof grant === 'object' && !Array.isArray(grant);
+        const code = String(isObject ? (grant.code || fallbackCode) : (fallbackCode || grant || '')).trim().toUpperCase();
+        if (!code) {
+            return null;
+        }
+
+        const rawQuantity = isObject
+            ? (grant.quantity ?? grant.total ?? grant.limit ?? grant.count)
+            : (typeof grant === 'number' ? grant : DEFAULT_VOUCHER_ASSIGNMENT_QUANTITY);
+        const quantity = getVoucherAssignmentQuantity(rawQuantity);
+        const rawUsed = isObject ? (grant.used ?? grant.usedCount ?? 0) : 0;
+        const used = Math.min(quantity, Math.max(0, Math.floor(Number(rawUsed) || 0)));
+
+        return {
+            code,
+            quantity,
+            used,
+            assignedAt: String(isObject ? (grant.assignedAt || '') : '').trim()
+        };
+    }
+
+    function getVoucherAssignmentGrantList(entry = {}) {
+        if (Array.isArray(entry)) {
+            return entry.map(code => ({ code }));
+        }
+
+        if (!entry || typeof entry !== 'object') {
+            return [];
+        }
+
+        if (Array.isArray(entry.grants)) {
+            return entry.grants;
+        }
+
+        if (entry.grants && typeof entry.grants === 'object') {
+            return Object.entries(entry.grants).map(([code, grant]) => (
+                grant && typeof grant === 'object'
+                    ? { ...grant, code: grant.code || code }
+                    : { code, quantity: grant }
+            ));
+        }
+
+        const rawCodes = Array.isArray(entry.codes)
+            ? entry.codes
+            : String(entry.codes || '').split(/[,\s]+/);
+        const quantities = entry.quantities && typeof entry.quantities === 'object' ? entry.quantities : {};
+        const usedCounts = entry.used && typeof entry.used === 'object' ? entry.used : {};
+        return rawCodes.map(code => {
+            const normalizedCode = String(code || '').trim().toUpperCase();
+            return {
+                code: normalizedCode,
+                quantity: quantities[normalizedCode],
+                used: usedCounts[normalizedCode]
+            };
+        });
+    }
+
     function normalizeVoucherAssignmentEntry(entry = {}, fallbackKey = '') {
-        entry = entry || {};
-        const accountKey = String(entry.accountKey || fallbackKey || '').trim();
-        const rawCodes = Array.isArray(entry)
-            ? entry
-            : Array.isArray(entry.codes)
-                ? entry.codes
-                : String(entry.codes || '').split(/[,\s]+/);
-        const codes = getUniqueValues(rawCodes
-            .map(code => String(code || '').trim().toUpperCase())
-            .filter(Boolean));
+        const source = entry && typeof entry === 'object' && !Array.isArray(entry) ? entry : {};
+        const accountKey = String(source.accountKey || fallbackKey || '').trim();
+        const grantMap = new Map();
+
+        getVoucherAssignmentGrantList(entry).forEach(grant => {
+            const normalizedGrant = normalizeVoucherAssignmentGrant(grant);
+            if (!normalizedGrant) {
+                return;
+            }
+
+            const existingGrant = grantMap.get(normalizedGrant.code);
+            grantMap.set(normalizedGrant.code, existingGrant
+                ? {
+                    ...existingGrant,
+                    quantity: Math.max(existingGrant.quantity, normalizedGrant.quantity),
+                    used: Math.max(existingGrant.used, normalizedGrant.used),
+                    assignedAt: existingGrant.assignedAt || normalizedGrant.assignedAt
+                }
+                : normalizedGrant);
+        });
+
+        const grants = Object.fromEntries(Array.from(grantMap.entries()).map(([code, grant]) => [code, grant]));
+        const codes = Array.from(grantMap.keys());
 
         return {
             accountKey,
-            accountLabel: sanitizeProductText(entry.accountLabel || '').trim(),
+            accountLabel: sanitizeProductText(source.accountLabel || '').trim(),
             codes,
-            updatedAt: String(entry.updatedAt || '').trim()
+            grants,
+            updatedAt: String(source.updatedAt || '').trim()
         };
     }
 
@@ -8948,6 +9111,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 const voucher = voucherMap.get(code);
                 return voucher && !isVoucherExpired(voucher);
             });
+            const nextGrants = Object.fromEntries(nextCodes.map(code => [code, normalized.grants[code]]).filter(([, grant]) => grant));
 
             if (nextCodes.length !== normalized.codes.length) {
                 changed = true;
@@ -8955,7 +9119,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
             result[normalized.accountKey] = {
                 ...normalized,
-                codes: nextCodes
+                codes: nextCodes,
+                grants: nextGrants
             };
             return result;
         }, {});
@@ -8975,19 +9140,122 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const store = pruneExpiredVoucherAssignments(getVoucherAssignmentStore());
         if (!store[accountKey]) {
-            store[accountKey] = {
+            store[accountKey] = normalizeVoucherAssignmentEntry({
                 accountKey,
                 accountLabel: getVoucherAssignmentAccountLabel(account),
                 codes: getDefaultVoucherCodesForAccount(account),
                 updatedAt: new Date().toISOString()
-            };
+            }, accountKey);
             saveVoucherAssignmentStore(store);
-        } else if (!store[accountKey].accountLabel) {
-            store[accountKey].accountLabel = getVoucherAssignmentAccountLabel(account);
+        } else if (!store[accountKey].accountLabel || !store[accountKey].grants) {
+            store[accountKey] = normalizeVoucherAssignmentEntry({
+                ...store[accountKey],
+                accountLabel: store[accountKey].accountLabel || getVoucherAssignmentAccountLabel(account)
+            }, accountKey);
             saveVoucherAssignmentStore(store);
         }
 
         return store[accountKey].codes || [];
+    }
+
+    function getVoucherAssignmentGrantForAccount(accountKey, code) {
+        const normalizedAccountKey = String(accountKey || '').trim();
+        const normalizedCode = String(code || '').trim().toUpperCase();
+        if (!normalizedAccountKey || !normalizedCode) {
+            return null;
+        }
+
+        const store = pruneExpiredVoucherAssignments(getVoucherAssignmentStore());
+        const entry = normalizeVoucherAssignmentEntry(store[normalizedAccountKey] || {}, normalizedAccountKey);
+        return entry.grants[normalizedCode] || null;
+    }
+
+    function getVoucherUsageForAccount(accountKey, code) {
+        const grant = getVoucherAssignmentGrantForAccount(accountKey, code);
+        if (!grant) {
+            return {
+                quantity: 0,
+                used: 0,
+                remaining: 0
+            };
+        }
+
+        const quantity = getVoucherAssignmentQuantity(grant?.quantity);
+        const used = Math.min(quantity, Math.max(0, Math.floor(Number(grant?.used || 0))));
+        return {
+            quantity,
+            used,
+            remaining: Math.max(0, quantity - used)
+        };
+    }
+
+    function getVoucherUsageForCurrentAccount(code) {
+        return getVoucherUsageForAccount(getVoucherAssignmentAccountKey(), code);
+    }
+
+    function getVoucherUsageStatsByCode() {
+        const stats = {};
+        const ensureStats = code => {
+            const normalizedCode = String(code || '').trim().toUpperCase();
+            if (!normalizedCode) {
+                return null;
+            }
+
+            if (!stats[normalizedCode]) {
+                stats[normalizedCode] = {
+                    granted: 0,
+                    assignmentUsed: 0,
+                    orderUsed: 0,
+                    usedCount: 0,
+                    discountTotal: 0,
+                    accountKeys: new Set()
+                };
+            }
+
+            return stats[normalizedCode];
+        };
+
+        Object.entries(pruneExpiredVoucherAssignments(getVoucherAssignmentStore())).forEach(([accountKey, entry]) => {
+            const normalizedEntry = normalizeVoucherAssignmentEntry(entry, accountKey);
+            Object.values(normalizedEntry.grants || {}).forEach(grant => {
+                const item = ensureStats(grant.code);
+                if (!item) {
+                    return;
+                }
+
+                item.granted += getVoucherAssignmentQuantity(grant.quantity);
+                item.assignmentUsed += Math.max(0, Math.floor(Number(grant.used || 0)));
+                if (accountKey) {
+                    item.accountKeys.add(accountKey);
+                }
+            });
+        });
+
+        getWorkspaceOrders().forEach(order => {
+            const code = String(order.voucherCode || '').trim().toUpperCase();
+            if (!code || Number(order.discount || 0) <= 0 || normalizeText(order.status || '') === 'da huy') {
+                return;
+            }
+
+            const item = ensureStats(code);
+            if (!item) {
+                return;
+            }
+
+            item.orderUsed += 1;
+            item.discountTotal += Number(order.discount || 0);
+            if (order.accountKey) {
+                item.accountKeys.add(order.accountKey);
+            }
+        });
+
+        Object.values(stats).forEach(item => {
+            item.usedCount = Math.max(item.assignmentUsed, item.orderUsed);
+            item.accountCount = item.accountKeys.size;
+            delete item.accountKeys;
+        });
+
+        return stats;
     }
 
     function getAssignedVoucherCodesForCurrentAccount() {
@@ -8998,10 +9266,40 @@ document.addEventListener('DOMContentLoaded', () => {
 
         ensureVoucherAssignmentsForAccount(currentUser);
         const store = pruneExpiredVoucherAssignments(getVoucherAssignmentStore());
-        return store[accountKey]?.codes || [];
+        const entry = normalizeVoucherAssignmentEntry(store[accountKey] || {}, accountKey);
+        return (entry.codes || []).filter(code => getVoucherUsageForAccount(accountKey, code).remaining > 0);
     }
 
-    function assignVoucherToAccount(accountKey, code) {
+    function consumeVoucherForCurrentAccount(code) {
+        const accountKey = getVoucherAssignmentAccountKey();
+        const normalizedCode = String(code || '').trim().toUpperCase();
+        if (!accountKey || !normalizedCode) {
+            return false;
+        }
+
+        const store = pruneExpiredVoucherAssignments(getVoucherAssignmentStore());
+        const currentEntry = normalizeVoucherAssignmentEntry(store[accountKey] || {}, accountKey);
+        const currentGrant = currentEntry.grants[normalizedCode];
+        if (!currentGrant || currentGrant.used >= currentGrant.quantity) {
+            return false;
+        }
+
+        store[accountKey] = {
+            ...currentEntry,
+            grants: {
+                ...currentEntry.grants,
+                [normalizedCode]: {
+                    ...currentGrant,
+                    used: Math.min(currentGrant.quantity, currentGrant.used + 1)
+                }
+            },
+            updatedAt: new Date().toISOString()
+        };
+        saveVoucherAssignmentStore(store);
+        return true;
+    }
+
+    function assignVoucherToAccount(accountKey, code, quantity = DEFAULT_VOUCHER_ASSIGNMENT_QUANTITY) {
         const normalizedAccountKey = String(accountKey || '').trim();
         const normalizedCode = String(code || '').trim().toUpperCase();
         if (!normalizedAccountKey || !normalizedCode) {
@@ -9016,11 +9314,26 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const store = pruneExpiredVoucherAssignments(getVoucherAssignmentStore());
         const currentEntry = normalizeVoucherAssignmentEntry(store[normalizedAccountKey] || {}, normalizedAccountKey);
+        const assignmentQuantity = getVoucherAssignmentQuantity(quantity);
+        const currentGrant = currentEntry.grants[normalizedCode] || {
+            code: normalizedCode,
+            quantity: assignmentQuantity,
+            used: 0,
+            assignedAt: new Date().toISOString()
+        };
         store[normalizedAccountKey] = {
             ...currentEntry,
             accountKey: normalizedAccountKey,
             accountLabel: getVoucherAssignmentAccountLabel(account),
             codes: getUniqueValues([...currentEntry.codes, normalizedCode]),
+            grants: {
+                ...currentEntry.grants,
+                [normalizedCode]: {
+                    ...currentGrant,
+                    quantity: Math.max(currentGrant.quantity || 0, currentGrant.used + assignmentQuantity),
+                    assignedAt: currentGrant.assignedAt || new Date().toISOString()
+                }
+            },
             updatedAt: new Date().toISOString()
         };
         saveVoucherAssignmentStore(store);
@@ -9036,9 +9349,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const store = getVoucherAssignmentStore();
         const currentEntry = normalizeVoucherAssignmentEntry(store[normalizedAccountKey] || {}, normalizedAccountKey);
+        const nextGrants = { ...currentEntry.grants };
+        delete nextGrants[normalizedCode];
         store[normalizedAccountKey] = {
             ...currentEntry,
             codes: currentEntry.codes.filter(item => item !== normalizedCode),
+            grants: nextGrants,
             updatedAt: new Date().toISOString()
         };
         saveVoucherAssignmentStore(store);
@@ -9062,9 +9378,12 @@ document.addEventListener('DOMContentLoaded', () => {
             const normalized = normalizeVoucherAssignmentEntry(entry, accountKey);
             const nextCodes = normalized.codes.filter(item => item !== normalizedCode);
             if (nextCodes.length !== normalized.codes.length) {
+                const nextGrants = { ...normalized.grants };
+                delete nextGrants[normalizedCode];
                 store[accountKey] = {
                     ...normalized,
                     codes: nextCodes,
+                    grants: nextGrants,
                     updatedAt: new Date().toISOString()
                 };
                 changed = true;
@@ -9094,6 +9413,11 @@ document.addEventListener('DOMContentLoaded', () => {
             store[accountKey] = {
                 ...normalized,
                 codes: getUniqueValues(normalized.codes.map(code => code === normalizedOldCode ? normalizedNewCode : code)),
+                grants: Object.fromEntries(Object.entries(normalized.grants).map(([code, grant]) => (
+                    code === normalizedOldCode
+                        ? [normalizedNewCode, { ...grant, code: normalizedNewCode }]
+                        : [code, grant]
+                ))),
                 updatedAt: new Date().toISOString()
             };
             changed = true;
@@ -9102,6 +9426,529 @@ document.addEventListener('DOMContentLoaded', () => {
         if (changed) {
             saveVoucherAssignmentStore(store);
         }
+    }
+
+    function formatDateTimeLocalInputValue(value) {
+        const date = value ? new Date(value) : new Date();
+        if (Number.isNaN(date.getTime())) {
+            return '';
+        }
+
+        const offsetDate = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
+        return offsetDate.toISOString().slice(0, 16);
+    }
+
+    function getDefaultPromoHuntCampaigns() {
+        const now = new Date();
+        const startAt = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
+        const endAt = new Date(now.getTime() + 45 * 24 * 60 * 60 * 1000).toISOString();
+        return [
+            { id: 'hunt-hotdeal10', voucherCode: 'HOTDEAL10', totalQuantity: 30, startAt, endAt, status: 'ACTIVE' },
+            { id: 'hunt-seagames15', voucherCode: 'SEAGAMES15', totalQuantity: 20, startAt, endAt, status: 'ACTIVE' },
+            { id: 'hunt-rungym18', voucherCode: 'RUNGYM18', totalQuantity: 15, startAt, endAt, status: 'ACTIVE' }
+        ];
+    }
+
+    function parseOptionalNonNegativeInteger(value) {
+        if (value === null || value === undefined || value === '') {
+            return null;
+        }
+
+        const numericValue = Number(value);
+        return Number.isFinite(numericValue) ? Math.max(0, Math.floor(numericValue)) : null;
+    }
+
+    function normalizePromoHuntCampaign(campaign = {}, index = 0) {
+        const voucherCode = String(campaign.voucherCode || campaign.voucher_code || campaign.code || '').trim().toUpperCase();
+        const id = String(campaign.id || `hunt-${voucherCode || index + 1}`).trim();
+        const totalQuantity = Math.max(0, Math.floor(Number(campaign.totalQuantity || campaign.total_quantity || campaign.quantity || campaign.limit || 0)));
+        const claimedCount = parseOptionalNonNegativeInteger(campaign.claimedCount ?? campaign.claimed_count);
+        const remaining = parseOptionalNonNegativeInteger(campaign.remaining ?? campaign.remaining_count ?? campaign.remainingQuantity ?? campaign.remaining_quantity);
+        return {
+            id,
+            voucherCode,
+            totalQuantity,
+            claimedCount,
+            remaining,
+            userClaimed: Boolean(campaign.userClaimed ?? campaign.user_claimed),
+            startAt: String(campaign.startAt || campaign.start_at || campaign.startsAt || campaign.starts_at || '').trim(),
+            endAt: String(campaign.endAt || campaign.end_at || campaign.endsAt || campaign.ends_at || '').trim(),
+            status: String(campaign.status || 'ACTIVE').trim() || 'ACTIVE',
+            createdAt: String(campaign.createdAt || campaign.created_at || new Date().toISOString()),
+            updatedAt: String(campaign.updatedAt || campaign.updated_at || new Date().toISOString())
+        };
+    }
+
+    function getPromoHuntCampaigns() {
+        const stored = readStorage(PROMO_HUNT_KEY, null);
+        if (!Array.isArray(stored) || !stored.length) {
+            const defaults = getDefaultPromoHuntCampaigns().map(normalizePromoHuntCampaign);
+            savePromoHuntCampaigns(defaults);
+            return defaults;
+        }
+
+        const normalized = stored
+            .map(normalizePromoHuntCampaign)
+            .filter(campaign => campaign.id && campaign.voucherCode);
+        if (localStorage.getItem(PROMO_HUNT_VERSION_KEY) !== PROMO_HUNT_VERSION) {
+            savePromoHuntCampaigns(normalized);
+        }
+        return normalized;
+    }
+
+    function savePromoHuntCampaigns(campaigns = []) {
+        const normalized = (Array.isArray(campaigns) ? campaigns : [])
+            .map(normalizePromoHuntCampaign)
+            .map(campaign => ({ ...campaign, userClaimed: false }))
+            .filter(campaign => campaign.id && campaign.voucherCode);
+        localStorage.setItem(PROMO_HUNT_KEY, JSON.stringify(normalized));
+        localStorage.setItem(PROMO_HUNT_VERSION_KEY, PROMO_HUNT_VERSION);
+    }
+
+    function getPromoHuntClaims() {
+        const stored = readStorage(PROMO_HUNT_CLAIMS_KEY, {});
+        return stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {};
+    }
+
+    function savePromoHuntClaims(claims = {}) {
+        localStorage.setItem(PROMO_HUNT_CLAIMS_KEY, JSON.stringify(
+            claims && typeof claims === 'object' && !Array.isArray(claims) ? claims : {}
+        ));
+    }
+
+    function syncPromoHuntUserClaimsFromServer(campaigns = []) {
+        const accountKey = getVoucherAssignmentAccountKey();
+        if (!accountKey || !Array.isArray(campaigns)) {
+            return;
+        }
+
+        const claims = getPromoHuntClaims();
+        let changed = false;
+        campaigns.forEach((campaign, index) => {
+            const normalized = normalizePromoHuntCampaign(campaign, index);
+            if (!normalized.id) {
+                return;
+            }
+
+            const serverUserClaimed = Boolean(campaign.userClaimed ?? campaign.user_claimed);
+            const campaignClaims = getPromoHuntCampaignClaims(normalized.id);
+            if (serverUserClaimed && !campaignClaims[accountKey]) {
+                campaignClaims[accountKey] = new Date().toISOString();
+                claims[normalized.id] = campaignClaims;
+                changed = true;
+            } else if (!serverUserClaimed && campaignClaims[accountKey]) {
+                delete campaignClaims[accountKey];
+                claims[normalized.id] = campaignClaims;
+                changed = true;
+            }
+        });
+
+        if (changed) {
+            savePromoHuntClaims(claims);
+        }
+    }
+
+    function replacePromoHuntCampaignsFromServer(campaigns = []) {
+        if (!Array.isArray(campaigns)) {
+            return getPromoHuntCampaigns();
+        }
+        syncPromoHuntUserClaimsFromServer(campaigns);
+        const normalized = campaigns
+            .map(normalizePromoHuntCampaign)
+            .filter(campaign => campaign.id && campaign.voucherCode);
+        savePromoHuntCampaigns(normalized);
+        return normalized;
+    }
+
+    function upsertPromoHuntCampaignFromServer(campaign = {}) {
+        syncPromoHuntUserClaimsFromServer([campaign]);
+        const normalized = normalizePromoHuntCampaign(campaign);
+        if (!normalized.id || !normalized.voucherCode) {
+            return;
+        }
+        const campaigns = getPromoHuntCampaigns();
+        const nextCampaigns = campaigns.some(item => item.id === normalized.id)
+            ? campaigns.map(item => item.id === normalized.id ? normalized : item)
+            : [normalized, ...campaigns];
+        savePromoHuntCampaigns(nextCampaigns);
+    }
+
+    async function syncPromoHuntCampaignsFromApi(options = {}) {
+        if (promoHuntSyncPromise) {
+            return promoHuntSyncPromise;
+        }
+
+        promoHuntSyncPromise = apiRequest('/promo-hunt/campaigns', { auth: Boolean(token) })
+            .then(campaigns => {
+                promoHuntBackendAvailable = true;
+                const normalized = replacePromoHuntCampaignsFromServer(Array.isArray(campaigns) ? campaigns : []);
+                if (options.render && currentView === 'promo-hunt') {
+                    renderPromoHuntView();
+                }
+                if (canAccessWorkspace() && document.getElementById('vouchers-mgmt-panel')) {
+                    renderVouchersPanel();
+                }
+                return normalized;
+            })
+            .catch(() => {
+                promoHuntBackendAvailable = false;
+                return getPromoHuntCampaigns();
+            })
+            .finally(() => {
+                promoHuntSyncPromise = null;
+            });
+
+        return promoHuntSyncPromise;
+    }
+
+    function getPromoHuntCampaignClaims(campaignId) {
+        const claims = getPromoHuntClaims();
+        const campaignClaims = claims[String(campaignId || '').trim()];
+        return campaignClaims && typeof campaignClaims === 'object' && !Array.isArray(campaignClaims)
+            ? campaignClaims
+            : {};
+    }
+
+    function getPromoHuntClaimCount(campaignId) {
+        return Object.keys(getPromoHuntCampaignClaims(campaignId)).length;
+    }
+
+    function getPromoHuntCampaignState(campaign = {}, accountKey = getVoucherAssignmentAccountKey()) {
+        const voucher = getManagedVoucherCatalog().find(item => item.code === campaign.voucherCode) || null;
+        const now = Date.now();
+        const startTime = campaign.startAt ? new Date(campaign.startAt).getTime() : 0;
+        const endTime = campaign.endAt ? new Date(campaign.endAt).getTime() : Number.POSITIVE_INFINITY;
+        const serverClaimedCount = parseOptionalNonNegativeInteger(campaign.claimedCount);
+        const serverRemaining = parseOptionalNonNegativeInteger(campaign.remaining);
+        const claimedCount = serverClaimedCount ?? getPromoHuntClaimCount(campaign.id);
+        const totalQuantity = Number(campaign.totalQuantity || 0);
+        const computedRemaining = Math.max(0, totalQuantity - claimedCount);
+        let remaining = serverRemaining ?? computedRemaining;
+        if (totalQuantity > 0 && remaining === 0 && claimedCount < totalQuantity) {
+            remaining = computedRemaining;
+        }
+        const userClaimed = Boolean(campaign.userClaimed) || Boolean(accountKey && getPromoHuntCampaignClaims(campaign.id)[accountKey]);
+        const normalizedStatus = normalizeText(campaign.status);
+        const disabledByStatus = !['active', 'hoat dong', 'dang mo', 'ho t ng', 'hoa t a ng'].includes(normalizedStatus);
+        const notStarted = Number.isFinite(startTime) && startTime > now;
+        const expired = Number.isFinite(endTime) && endTime < now;
+        const voucherUnavailable = !voucher || !isVoucherUsable(voucher);
+        const exhausted = remaining <= 0;
+
+        let reason = '';
+        if (userClaimed) {
+            reason = 'Bạn đã nhận mã này';
+        } else if (exhausted) {
+            reason = 'Mã khuyến mãi đã hết';
+        } else if (notStarted) {
+            reason = 'Chưa đến giờ săn mã';
+        } else if (expired) {
+            reason = 'Đã hết thời gian săn mã';
+        } else if (disabledByStatus) {
+            reason = 'Chiến dịch đang tạm khóa';
+        } else if (voucherUnavailable) {
+            reason = 'Voucher không còn hiệu lực';
+        }
+
+        return {
+            voucher,
+            claimedCount,
+            remaining,
+            userClaimed,
+            notStarted,
+            expired,
+            disabledByStatus,
+            voucherUnavailable,
+            exhausted,
+            canClaim: Boolean(voucher && accountKey && !userClaimed && !exhausted && !notStarted && !expired && !disabledByStatus && !voucherUnavailable),
+            reason
+        };
+    }
+
+    async function claimPromoHuntCampaign(campaignId) {
+        if (currentUser && canAccessWorkspace()) {
+            showCenteredMessage('Tài khoản nhân viên và quản lý chỉ được xem săn khuyến mãi, không được nhận mã.', 'error');
+            renderPromoHuntView();
+            return;
+        }
+
+        if (!ensureCustomerAccess('Hãy đăng nhập bằng tài khoản khách hàng để săn khuyến mãi.')) {
+            return;
+        }
+
+        const campaign = getPromoHuntCampaigns().find(item => item.id === String(campaignId || '').trim());
+        if (!campaign) {
+            return;
+        }
+
+        const accountKey = getVoucherAssignmentAccountKey();
+        const state = getPromoHuntCampaignState(campaign, accountKey);
+        if (!state.canClaim) {
+            showCenteredMessage(state.reason || 'Không thể nhận mã khuyến mãi này.', 'error');
+            renderPromoHuntView();
+            return;
+        }
+
+        if (promoHuntBackendAvailable && token) {
+            try {
+                const response = await apiRequest(`/promo-hunt/campaigns/${encodeURIComponent(campaign.id)}/claim`, {
+                    method: 'POST'
+                });
+                upsertPromoHuntCampaignFromServer(response);
+                assignVoucherToAccount(accountKey, campaign.voucherCode, 1);
+                showCenteredMessage(`Đã nhận mã ${campaign.voucherCode}. Mã đã được thêm vào ví ưu đãi của tài khoản.`);
+                renderPromoHuntView();
+                renderCartView();
+                if (currentView === 'checkout') {
+                    renderCheckoutView();
+                }
+                return;
+            } catch (error) {
+                if (promoHuntBackendAvailable) {
+                    showCenteredMessage(error.message || 'Không thể nhận mã khuyến mãi này.', 'error');
+                    await syncPromoHuntCampaignsFromApi({ render: true });
+                    return;
+                }
+            }
+        }
+
+        const claims = getPromoHuntClaims();
+        const campaignClaims = getPromoHuntCampaignClaims(campaign.id);
+        campaignClaims[accountKey] = new Date().toISOString();
+        claims[campaign.id] = campaignClaims;
+        savePromoHuntClaims(claims);
+        assignVoucherToAccount(accountKey, campaign.voucherCode, 1);
+        showCenteredMessage(`Đã nhận mã ${campaign.voucherCode}. Mã đã được thêm vào ví ưu đãi của tài khoản.`);
+        renderPromoHuntView();
+        renderCartView();
+        if (currentView === 'checkout') {
+            renderCheckoutView();
+        }
+    }
+
+    async function savePromoHuntCampaignFromForm() {
+        const voucherCode = document.getElementById('promo-hunt-voucher-code')?.value || '';
+        const totalQuantity = Number(document.getElementById('promo-hunt-quantity')?.value || 0);
+        const startAt = document.getElementById('promo-hunt-start-at')?.value || '';
+        const endAt = document.getElementById('promo-hunt-end-at')?.value || '';
+        const status = document.getElementById('promo-hunt-status')?.value || 'ACTIVE';
+        if (!voucherCode || totalQuantity < 1 || !startAt || !endAt) {
+            return;
+        }
+        const startDate = new Date(startAt);
+        const endDate = new Date(endAt);
+        if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime()) || endDate <= startDate) {
+            showCenteredMessage('Thời gian kết thúc phải sau thời gian bắt đầu.', 'error');
+            return;
+        }
+
+        if (promoHuntBackendAvailable && token) {
+            try {
+                const response = await apiRequest('/admin/promo-hunt/campaigns', {
+                    method: 'POST',
+                    body: {
+                        voucher_code: voucherCode,
+                        total_quantity: totalQuantity,
+                        start_at: startAt,
+                        end_at: endAt,
+                        status
+                    }
+                });
+                upsertPromoHuntCampaignFromServer(response);
+                renderVouchersPanel();
+                if (currentView === 'promo-hunt') {
+                    renderPromoHuntView();
+                }
+                return;
+            } catch (error) {
+                showCenteredMessage(error.message || 'Không thể mở chiến dịch săn khuyến mãi.', 'error');
+                return;
+            }
+        }
+
+        const campaign = normalizePromoHuntCampaign({
+            id: generateRecordId('hunt'),
+            voucherCode,
+            totalQuantity,
+            startAt: startDate.toISOString(),
+            endAt: endDate.toISOString(),
+            status,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString()
+        });
+        savePromoHuntCampaigns([campaign, ...getPromoHuntCampaigns()]);
+        renderVouchersPanel();
+        if (currentView === 'promo-hunt') {
+            renderPromoHuntView();
+        }
+    }
+
+    async function deletePromoHuntCampaign(campaignId) {
+        const normalizedId = String(campaignId || '').trim();
+        if (!normalizedId) {
+            return;
+        }
+
+        if (promoHuntBackendAvailable && token) {
+            try {
+                await apiRequest(`/admin/promo-hunt/campaigns/${encodeURIComponent(normalizedId)}`, {
+                    method: 'DELETE'
+                });
+            } catch (error) {
+                showCenteredMessage(error.message || 'Không thể xóa chiến dịch săn khuyến mãi.', 'error');
+                return;
+            }
+        }
+
+        savePromoHuntCampaigns(getPromoHuntCampaigns().filter(campaign => campaign.id !== normalizedId));
+        const claims = getPromoHuntClaims();
+        delete claims[normalizedId];
+        savePromoHuntClaims(claims);
+        renderVouchersPanel();
+        if (currentView === 'promo-hunt') {
+            renderPromoHuntView();
+        }
+    }
+
+    function replacePromoHuntVoucherCode(oldCode, newCode) {
+        const normalizedOldCode = String(oldCode || '').trim().toUpperCase();
+        const normalizedNewCode = String(newCode || '').trim().toUpperCase();
+        if (!normalizedOldCode || !normalizedNewCode || normalizedOldCode === normalizedNewCode) {
+            return;
+        }
+
+        savePromoHuntCampaigns(getPromoHuntCampaigns().map(campaign => (
+            campaign.voucherCode === normalizedOldCode
+                ? { ...campaign, voucherCode: normalizedNewCode, updatedAt: new Date().toISOString() }
+                : campaign
+        )));
+    }
+
+    function removePromoHuntVoucherCode(code) {
+        const normalizedCode = String(code || '').trim().toUpperCase();
+        if (!normalizedCode) {
+            return;
+        }
+        const removedCampaignIds = getPromoHuntCampaigns()
+            .filter(campaign => campaign.voucherCode === normalizedCode)
+            .map(campaign => campaign.id);
+        savePromoHuntCampaigns(getPromoHuntCampaigns().filter(campaign => campaign.voucherCode !== normalizedCode));
+        if (removedCampaignIds.length) {
+            const claims = getPromoHuntClaims();
+            removedCampaignIds.forEach(id => {
+                delete claims[id];
+            });
+            savePromoHuntClaims(claims);
+        }
+    }
+
+    function renderPromoHuntView() {
+        if (!promoHuntView || !promoHuntGrid) {
+            return;
+        }
+
+        const campaigns = getPromoHuntCampaigns()
+            .map(campaign => ({
+                campaign,
+                state: getPromoHuntCampaignState(campaign)
+            }))
+            .filter(item => item.state.voucher)
+            .sort((left, right) => {
+                const leftExpired = left.state.expired ? 1 : 0;
+                const rightExpired = right.state.expired ? 1 : 0;
+                if (leftExpired !== rightExpired) {
+                    return leftExpired - rightExpired;
+                }
+                return new Date(left.campaign.endAt || 0) - new Date(right.campaign.endAt || 0);
+            });
+
+        if (promoHuntCount) {
+            promoHuntCount.textContent = `${campaigns.length} ưu đãi`;
+        }
+
+        if (!campaigns.length) {
+            promoHuntGrid.innerHTML = '<div class="cart-empty-state"><h3>Chưa có mã khuyến mãi để săn</h3><p>Quản trị viên chưa mở chiến dịch săn mã nào trong thời điểm này.</p></div>';
+            repairTextNodes(promoHuntGrid);
+            return;
+        }
+
+        const isWorkspaceUser = canAccessWorkspace();
+        const canSeePromoHuntInventory = isWorkspaceUser;
+        promoHuntGrid.innerHTML = campaigns.map(({ campaign, state }) => {
+            const voucher = state.voucher;
+            const categories = getVoucherCategories(voucher).join(', ');
+            const isDisabled = isWorkspaceUser || (!state.canClaim && Boolean(currentUser || state.exhausted || state.notStarted || state.expired || state.disabledByStatus || state.voucherUnavailable));
+            const reason = isWorkspaceUser
+                ? 'Tài khoản nhân viên và quản lý chỉ được xem ưu đãi.'
+                : state.reason;
+            const publicStatus = state.userClaimed
+                ? 'Đã nhận'
+                : state.exhausted
+                    ? 'Đã hết'
+                    : state.notStarted
+                        ? 'Sắp mở'
+                        : state.expired
+                            ? 'Hết hạn'
+                            : state.disabledByStatus
+                                ? 'Tạm khóa'
+                                : state.voucherUnavailable
+                                    ? 'Không hiệu lực'
+                                    : 'Đang mở';
+            const inventoryMarkup = canSeePromoHuntInventory
+                ? `
+                    <div class="promo-hunt-progress">
+                        <span>Đã nhận ${state.claimedCount}/${campaign.totalQuantity}</span>
+                        <strong>${state.remaining > 0 ? `Còn ${state.remaining}` : 'Đã hết'}</strong>
+                    </div>
+                `
+                : `
+                    <div class="promo-hunt-progress">
+                        <span>Trạng thái</span>
+                        <strong>${escapeHtml(publicStatus)}</strong>
+                    </div>
+                `;
+            const buttonText = isWorkspaceUser
+                ? 'Chỉ dành cho khách hàng'
+                : state.userClaimed
+                ? 'Đã nhận'
+                : state.exhausted
+                    ? 'Mã khuyến mãi đã hết'
+                    : currentUser
+                        ? 'Nhận mã'
+                        : 'Đăng nhập để nhận';
+            return `
+                <article class="promo-hunt-card ${state.exhausted ? 'exhausted' : ''} ${state.userClaimed ? 'claimed' : ''}">
+                    <div class="promo-hunt-card-head">
+                        <span class="promo-hunt-badge">${escapeHtml(voucher.code)}</span>
+                        <span class="workspace-chip">${escapeHtml(getVoucherDisplayStatus(voucher))}</span>
+                    </div>
+                    <h3>${escapeHtml(voucher.label)}</h3>
+                    <p class="promo-hunt-discount">Giảm ${Math.round(Number(voucher.percent || 0) * 100)}% · tối đa ${formatCurrency(voucher.maxDiscount)}</p>
+                    <p class="voucher-meta">Đơn tối thiểu ${formatCurrency(voucher.minOrder)}</p>
+                    <p class="promo-hunt-note"><strong>Áp dụng cho:</strong> ${escapeHtml(categories)}</p>
+                    <p class="voucher-meta">Thời gian: ${escapeHtml(formatDateTimeDisplay(campaign.startAt))} - ${escapeHtml(formatDateTimeDisplay(campaign.endAt))}</p>
+                    ${inventoryMarkup}
+                    ${reason ? `<p class="promo-hunt-reason">${escapeHtml(reason)}</p>` : ''}
+                    <button class="login-submit-btn text-bold" type="button" data-promo-hunt-claim="${escapeHtml(campaign.id)}" ${isDisabled ? 'disabled' : ''}>
+                        ${buttonText}
+                    </button>
+                </article>
+            `;
+        }).join('');
+        repairTextNodes(promoHuntGrid);
+    }
+
+    function openPromoHuntView() {
+        currentView = 'promo-hunt';
+        currentCollectionId = '';
+        resetCatalogState({ clearQuery: true, skipRender: true });
+        closeMegaMenu();
+        closeSearchSuggestions();
+        renderPromoHuntView();
+        void syncPromoHuntCampaignsFromApi({ render: true });
+        syncMainView();
+        syncNavState();
+        window.scrollTo({ top: 0, behavior: 'smooth' });
     }
 
     function getCustomerVisibleVouchers() {
@@ -9143,13 +9990,17 @@ document.addEventListener('DOMContentLoaded', () => {
             const maxDiscount = Number(voucher.maxDiscount || 0);
             const discountAmount = getVoucherDiscountAmount(voucher, subtotal);
             const matchesCart = voucherAppliesToCurrentCart(voucher);
-            const isEligible = subtotal >= minOrder && subtotal > 0 && matchesCart;
+            const usage = getVoucherUsageForCurrentAccount(voucher.code);
+            const hasRemaining = usage.remaining > 0;
+            const isEligible = subtotal >= minOrder && subtotal > 0 && matchesCart && hasRemaining;
             const isActive = appliedVoucher?.code === voucher.code;
             const categories = getVoucherCategories(voucher).join(', ');
+            const usageText = `Còn ${usage.remaining}/${usage.quantity} lượt dùng`;
             const expiryText = voucher.expiresAt ? `Hết hạn: ${formatDateTimeDisplay(`${voucher.expiresAt}T23:59:59`)}` : 'Không giới hạn hạn dùng';
 
             return `
                 <article class="voucher-card ${isEligible ? '' : 'disabled'} ${isActive ? 'active' : ''}">
+                    <p class="voucher-meta voucher-usage-meta">${escapeHtml(usageText)}</p>
                     <div class="voucher-card-main">
                         <div class="voucher-code-row">
                             <strong class="voucher-code">${voucher.code}</strong>
@@ -10803,8 +11654,14 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
+        if (canAccessWorkspace() && promoHuntBackendAvailable && Date.now() - promoHuntManagerSyncedAt > 30000) {
+            promoHuntManagerSyncedAt = Date.now();
+            void syncPromoHuntCampaignsFromApi({ render: true });
+        }
+
         const state = getWorkspaceState();
         const allVouchers = getManagedVoucherCatalog();
+        const voucherUsageStats = getVoucherUsageStatsByCode();
         const categoryFilter = normalizeText(state.managerVoucherCategoryFilter || 'all');
         const statusFilter = String(state.managerVoucherStatusFilter || 'all');
         const vouchers = allVouchers.filter(voucher => {
@@ -10833,13 +11690,16 @@ document.addEventListener('DOMContentLoaded', () => {
             ? state.voucherAssignmentAccountKey
             : fallbackAssignmentAccountKey;
         state.voucherAssignmentAccountKey = selectedAssignmentAccountKey;
-        const selectedAssignment = voucherAssignments[selectedAssignmentAccountKey] || { codes: [] };
+        const selectedAssignment = normalizeVoucherAssignmentEntry(voucherAssignments[selectedAssignmentAccountKey] || { codes: [] }, selectedAssignmentAccountKey);
         const selectedAssignedCodes = Array.isArray(selectedAssignment.codes) ? selectedAssignment.codes : [];
         const selectedAssignedCodeSet = new Set(selectedAssignedCodes);
         const selectedAssignedVouchers = selectedAssignedCodes
             .map(code => allVouchers.find(voucher => voucher.code === code))
             .filter(Boolean);
         const unassignedAssignableVouchers = activeAssignableVouchers.filter(voucher => !selectedAssignedCodeSet.has(voucher.code));
+        const promoHuntCampaigns = getPromoHuntCampaigns();
+        const promoHuntStartDefault = formatDateTimeLocalInputValue(new Date());
+        const promoHuntEndDefault = formatDateTimeLocalInputValue(new Date(Date.now() + 7 * 24 * 60 * 60 * 1000));
 
         panel.innerHTML = `
             <div class="workspace-grid">
@@ -10874,29 +11734,43 @@ document.addEventListener('DOMContentLoaded', () => {
                                 <th>Mã</th>
                                 <th>Mô tả</th>
                                 <th>Điều kiện</th>
+                                <th>L&#432;&#7907;t d&#249;ng</th>
                                 <th>Trạng thái</th>
                                 <th>Thao tác</th>
                             </tr>
                         </thead>
                         <tbody>
-                            ${vouchers.map(voucher => `
-                                <tr>
-                                    <td><strong>${escapeHtml(voucher.code)}</strong></td>
-                                    <td>
-                                        <strong>${escapeHtml(voucher.label)}</strong>
-                                        <p class="voucher-meta">Danh mục: ${escapeHtml(getVoucherCategories(voucher).join(', '))}</p>
-                                        <p class="voucher-meta">${voucher.expiresAt ? `Hết hạn: ${escapeHtml(formatDateTimeDisplay(`${voucher.expiresAt}T23:59:59`))}` : 'Không giới hạn hạn dùng'}</p>
-                                    </td>
-                                    <td>Đơn tối thiểu ${formatCurrency(voucher.minOrder)} · tối đa ${formatCurrency(voucher.maxDiscount)}</td>
-                                    <td><span class="workspace-chip">${escapeHtml(getVoucherDisplayStatus(voucher))}</span></td>
-                                    <td>
-                                        <div class="workspace-row-actions">
-                                            <button class="secondary-btn text-bold" type="button" data-voucher-action="edit" data-voucher-code="${escapeHtml(voucher.code)}">Sửa</button>
-                                            <button class="cart-text-btn danger" type="button" data-voucher-action="delete" data-voucher-code="${escapeHtml(voucher.code)}">Xóa</button>
-                                        </div>
-                                    </td>
-                                </tr>
-                            `).join('')}
+                            ${vouchers.map(voucher => {
+                                const usageStats = voucherUsageStats[String(voucher.code || '').trim().toUpperCase()] || {
+                                    granted: 0,
+                                    usedCount: 0,
+                                    discountTotal: 0,
+                                    accountCount: 0
+                                };
+                                return `
+                                    <tr>
+                                        <td><strong>${escapeHtml(voucher.code)}</strong></td>
+                                        <td>
+                                            <strong>${escapeHtml(voucher.label)}</strong>
+                                            <p class="voucher-meta">Danh mục: ${escapeHtml(getVoucherCategories(voucher).join(', '))}</p>
+                                            <p class="voucher-meta">${voucher.expiresAt ? `Hết hạn: ${escapeHtml(formatDateTimeDisplay(`${voucher.expiresAt}T23:59:59`))}` : 'Không giới hạn hạn dùng'}</p>
+                                        </td>
+                                        <td>Đơn tối thiểu ${formatCurrency(voucher.minOrder)} · tối đa ${formatCurrency(voucher.maxDiscount)}</td>
+                                        <td>
+                                            <strong>${Number(usageStats.usedCount || 0)}</strong> l&#432;&#7907;t
+                                            <p class="voucher-meta">&#272;&#227; c&#7845;p: ${Number(usageStats.granted || 0)} &middot; TK: ${Number(usageStats.accountCount || 0)}</p>
+                                            <p class="voucher-meta">T&#7893;ng gi&#7843;m: ${formatCurrency(usageStats.discountTotal || 0)}</p>
+                                        </td>
+                                        <td><span class="workspace-chip">${escapeHtml(getVoucherDisplayStatus(voucher))}</span></td>
+                                        <td>
+                                            <div class="workspace-row-actions">
+                                                <button class="secondary-btn text-bold" type="button" data-voucher-action="edit" data-voucher-code="${escapeHtml(voucher.code)}">Sửa</button>
+                                                <button class="cart-text-btn danger" type="button" data-voucher-action="delete" data-voucher-code="${escapeHtml(voucher.code)}">Xóa</button>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                `;
+                            }).join('')}
                         </tbody>
                     </table>
                 </div>
@@ -10973,6 +11847,10 @@ document.addEventListener('DOMContentLoaded', () => {
                                         : '<option value="">Không còn voucher có thể cấp</option>'}
                                 </select>
                             </div>
+                            <div class="form-group">
+                                <label class="text-14" for="voucher-assignment-quantity">Số lượt cấp</label>
+                                <input id="voucher-assignment-quantity" type="number" min="1" max="99" value="1" ${selectedAssignmentAccountKey && unassignedAssignableVouchers.length ? '' : 'disabled'}>
+                            </div>
                             <button class="login-submit-btn text-bold" type="submit" ${selectedAssignmentAccountKey && unassignedAssignableVouchers.length ? '' : 'disabled'}>Cấp voucher</button>
                         </form>
                         <div class="voucher-assignment-list">
@@ -10982,12 +11860,79 @@ document.addEventListener('DOMContentLoaded', () => {
                                         <div>
                                             <strong>${escapeHtml(voucher.code)}</strong>
                                             <p class="voucher-meta">${escapeHtml(voucher.label || 'Voucher')}</p>
+                                            <p class="voucher-meta">Còn ${getVoucherUsageForAccount(selectedAssignmentAccountKey, voucher.code).remaining}/${getVoucherUsageForAccount(selectedAssignmentAccountKey, voucher.code).quantity} lượt dùng</p>
                                             <p class="voucher-meta">${voucher.expiresAt ? `Hết hạn: ${escapeHtml(formatDateTimeDisplay(`${voucher.expiresAt}T23:59:59`))}` : 'Không giới hạn hạn dùng'}</p>
                                         </div>
                                         <button class="cart-text-btn danger" type="button" data-voucher-unassign="${escapeHtml(voucher.code)}" data-voucher-account="${escapeHtml(selectedAssignmentAccountKey)}">Thu hồi</button>
                                     </article>
                                 `).join('')
                                 : '<p class="voucher-assignment-empty">Tài khoản đang chọn chưa được cấp voucher nào.</p>'}
+                        </div>
+                    </section>
+                    <section class="voucher-assignment-card promo-hunt-manager-card">
+                        <div class="workspace-side-head">
+                            <div>
+                                <h3>Gắn vào Săn khuyến mãi</h3>
+                                <p class="customer-card-meta">Mỗi chiến dịch có số lượng và khung thời gian riêng. Mỗi tài khoản khách chỉ nhận được một lần.</p>
+                            </div>
+                        </div>
+                        <form id="promo-hunt-form" class="workspace-form">
+                            <div class="form-group">
+                                <label class="text-14" for="promo-hunt-voucher-code">Voucher săn</label>
+                                <select id="promo-hunt-voucher-code" ${activeAssignableVouchers.length ? '' : 'disabled'}>
+                                    ${activeAssignableVouchers.length
+                                        ? activeAssignableVouchers.map(voucher => `<option value="${escapeHtml(voucher.code)}">${escapeHtml(voucher.code)} - ${escapeHtml(voucher.label || 'Voucher')}</option>`).join('')
+                                        : '<option value="">Không có voucher còn hiệu lực</option>'}
+                                </select>
+                            </div>
+                            <div class="form-grid compact-grid">
+                                <div class="form-group">
+                                    <label class="text-14" for="promo-hunt-quantity">Số lượng</label>
+                                    <input id="promo-hunt-quantity" type="number" min="1" max="999" value="20" ${activeAssignableVouchers.length ? '' : 'disabled'}>
+                                </div>
+                                <div class="form-group">
+                                    <label class="text-14" for="promo-hunt-status">Trạng thái</label>
+                                    <select id="promo-hunt-status" ${activeAssignableVouchers.length ? '' : 'disabled'}>
+                                        <option value="ACTIVE">Hoạt động</option>
+                                        <option value="DISABLED">Tạm khóa</option>
+                                    </select>
+                                </div>
+                                <div class="form-group">
+                                    <label class="text-14" for="promo-hunt-start-at">Bắt đầu</label>
+                                    <input id="promo-hunt-start-at" type="datetime-local" value="${escapeHtml(promoHuntStartDefault)}" ${activeAssignableVouchers.length ? '' : 'disabled'} required>
+                                </div>
+                                <div class="form-group">
+                                    <label class="text-14" for="promo-hunt-end-at">Kết thúc</label>
+                                    <input id="promo-hunt-end-at" type="datetime-local" value="${escapeHtml(promoHuntEndDefault)}" ${activeAssignableVouchers.length ? '' : 'disabled'} required>
+                                </div>
+                            </div>
+                            <button class="login-submit-btn text-bold" type="submit" ${activeAssignableVouchers.length ? '' : 'disabled'}>Mở săn mã</button>
+                        </form>
+                        <div class="promo-hunt-manager-list">
+                            ${promoHuntCampaigns.length
+                                ? promoHuntCampaigns.map(campaign => {
+                                    const campaignState = getPromoHuntCampaignState(campaign, '');
+                                    const voucher = campaignState.voucher;
+                                    const usageStats = voucherUsageStats[String(campaign.voucherCode || '').trim().toUpperCase()] || {
+                                        usedCount: 0,
+                                        discountTotal: 0
+                                    };
+                                    return `
+                                        <article class="voucher-assignment-item promo-hunt-manager-item">
+                                            <div>
+                                                <strong>${escapeHtml(campaign.voucherCode)}</strong>
+                                                <p class="voucher-meta">${escapeHtml(voucher?.label || 'Voucher không còn trong danh sách')}</p>
+                                                <p class="voucher-meta">Áp dụng: ${escapeHtml(voucher ? getVoucherCategories(voucher).join(', ') : 'Không xác định')}</p>
+                                                <p class="voucher-meta">&#272;&#227; nh&#7853;n: ${campaignState.claimedCount}/${campaign.totalQuantity} &middot; C&#242;n ${campaignState.remaining}</p>
+                                                <p class="voucher-meta">&#272;&#227; d&#249;ng: ${Number(usageStats.usedCount || 0)} &#273;&#417;n &middot; T&#7893;ng gi&#7843;m: ${formatCurrency(usageStats.discountTotal || 0)}</p>
+                                                <p class="voucher-meta">Tr&#7841;ng th&#225;i: ${escapeHtml(campaign.status)}</p>
+                                                <p class="voucher-meta">${escapeHtml(formatDateTimeDisplay(campaign.startAt))} - ${escapeHtml(formatDateTimeDisplay(campaign.endAt))}</p>
+                                            </div>
+                                            <button class="cart-text-btn danger" type="button" data-promo-hunt-action="delete" data-promo-hunt-id="${escapeHtml(campaign.id)}">Xóa</button>
+                                        </article>
+                                    `;
+                                }).join('')
+                                : '<p class="voucher-assignment-empty">Chưa có chiến dịch săn khuyến mãi nào.</p>'}
                         </div>
                     </section>
                 </aside>
@@ -11299,7 +12244,7 @@ document.addEventListener('DOMContentLoaded', () => {
         updateCartCount();
         updateWishlistCount();
         updateAuthUI();
-        if (['wishlist', 'cart', 'checkout', 'address-book', 'orders', 'workspace'].includes(currentView)) {
+        if (['wishlist', 'cart', 'checkout', 'address-book', 'orders', 'workspace', 'promo-hunt'].includes(currentView)) {
             showCatalogView();
         } else {
             void loadHomeRecommendations(true);
@@ -11367,6 +12312,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const existingOrders = getOrderHistory();
         saveOrderHistory([nextOrder, ...existingOrders]);
+        if (appliedVoucher?.code) {
+            consumeVoucherForCurrentAccount(appliedVoucher.code);
+        }
+
         selectedItems.forEach(item => {
             trackBehaviorEvent({
                 eventType: 'PURCHASE',
@@ -11385,7 +12334,7 @@ document.addEventListener('DOMContentLoaded', () => {
             });
         });
 
-        const remainingItems = getCartItems().filter(item => !item.selected);
+        const remainingItems = getCartItems().filter(item => !normalizeCartSelectionFlag(item.selected));
         saveCartItems(remainingItems);
         saveAppliedVoucherCode('');
         invalidateRecommendationCache();
@@ -11566,6 +12515,7 @@ document.addEventListener('DOMContentLoaded', () => {
         nextCatalog.push(nextVoucher);
         saveManagedVoucherCatalog(nextCatalog);
         replaceVoucherCodeInAssignments(originalCode, nextVoucher.code);
+        replacePromoHuntVoucherCode(originalCode, nextVoucher.code);
         getWorkspaceState().editingVoucherCode = '';
         renderVouchersPanel();
         renderCartView();
@@ -11578,6 +12528,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const nextCatalog = getManagedVoucherCatalog().filter(voucher => voucher.code !== normalizedCode);
         saveManagedVoucherCatalog(nextCatalog);
         removeVoucherCodeFromAllAssignments(normalizedCode);
+        removePromoHuntVoucherCode(normalizedCode);
         if (getAppliedVoucherCode() === normalizedCode) {
             saveAppliedVoucherCode('');
         }
@@ -11833,6 +12784,15 @@ document.addEventListener('DOMContentLoaded', () => {
                 return;
             }
 
+            const promoHuntButton = event.target.closest('[data-promo-hunt-action]');
+            if (promoHuntButton) {
+                event.preventDefault();
+                if (promoHuntButton.dataset.promoHuntAction === 'delete' && confirm('Xóa chiến dịch săn khuyến mãi này?')) {
+                    void deletePromoHuntCampaign(promoHuntButton.dataset.promoHuntId);
+                }
+                return;
+            }
+
             const homeShowcaseToggleButton = event.target.closest('[data-home-showcase-toggle]');
             if (homeShowcaseToggleButton) {
                 event.preventDefault();
@@ -12044,7 +13004,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 event.preventDefault();
                 const accountKey = document.getElementById('voucher-assignment-account')?.value || '';
                 const voucherCode = document.getElementById('voucher-assignment-code')?.value || '';
-                if (assignVoucherToAccount(accountKey, voucherCode)) {
+                const voucherQuantity = document.getElementById('voucher-assignment-quantity')?.value || DEFAULT_VOUCHER_ASSIGNMENT_QUANTITY;
+                if (assignVoucherToAccount(accountKey, voucherCode, voucherQuantity)) {
                     getWorkspaceState().voucherAssignmentAccountKey = accountKey;
                     renderVouchersPanel();
                     renderCartView();
@@ -12055,6 +13016,12 @@ document.addEventListener('DOMContentLoaded', () => {
                         renderCatalog();
                     }
                 }
+                return;
+            }
+
+            if (event.target.id === 'promo-hunt-form') {
+                event.preventDefault();
+                void savePromoHuntCampaignFromForm();
                 return;
             }
 
@@ -12871,6 +13838,19 @@ document.addEventListener('DOMContentLoaded', () => {
         return `${String(productId)}::${sizeKey}::${typeKey}`;
     }
 
+    function normalizeCartSelectionFlag(value) {
+        if (value === false || value === 0 || value === null) {
+            return false;
+        }
+
+        const normalized = normalizeText(value);
+        if (['false', '0', 'no', 'off', 'khong', 'bo chon', 'unchecked'].includes(normalized)) {
+            return false;
+        }
+
+        return true;
+    }
+
     function getCartItems() {
         const cartStorageKey = getCurrentCartStorageKey();
         if (!cartStorageKey) {
@@ -12899,7 +13879,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const variantType = String(rawItem?.variantType || rawItem?.type || fallbackVariantType).trim();
             const lineId = buildCartLineId(productId, size, variantType);
             const quantity = Math.max(1, Math.round(Number(rawItem?.quantity || 1)));
-            const selected = rawItem?.selected !== false;
+            const selected = normalizeCartSelectionFlag(rawItem?.selected);
 
             if (cartMap.has(lineId)) {
                 const existing = cartMap.get(lineId);
@@ -12940,7 +13920,7 @@ document.addEventListener('DOMContentLoaded', () => {
             size: String(item.size || 'Tieu chuan'),
             variantType: String(item.variantType || ''),
             quantity: Math.max(1, Math.round(Number(item.quantity || 1))),
-            selected: item.selected !== false
+            selected: normalizeCartSelectionFlag(item.selected)
         }));
 
         localStorage.setItem(cartStorageKey, JSON.stringify(normalizedItems));
@@ -12975,7 +13955,8 @@ document.addEventListener('DOMContentLoaded', () => {
                     typeOptions,
                     quantity,
                     unitPrice,
-                    subtotal: unitPrice * quantity
+                    subtotal: unitPrice * quantity,
+                    selected: normalizeCartSelectionFlag(item.selected)
                 };
             })
             .filter(Boolean);
@@ -13600,6 +14581,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const isAddressBookView = currentView === 'address-book';
         const isOrdersView = currentView === 'orders';
         const isProductDetailView = currentView === 'product-detail';
+        const isPromoHuntView = currentView === 'promo-hunt';
         const isBannerVisible = !isWorkspaceView && shouldShowBanner();
         const mainContent = document.getElementById('main-content');
         const footer = document.getElementById('footer');
@@ -13618,6 +14600,7 @@ document.addEventListener('DOMContentLoaded', () => {
         addressBookView.classList.toggle('hidden', !isAddressBookView);
         ordersView.classList.toggle('hidden', !isOrdersView);
         productDetailView?.classList.toggle('hidden', !isProductDetailView);
+        promoHuntView?.classList.toggle('hidden', !isPromoHuntView);
         banner.classList.toggle('hidden', !isBannerVisible);
         const shouldShowHomeLanding = shouldShowHomeRecommendations();
         if (homeFeatureStrip) {
@@ -13640,7 +14623,7 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
-        if (isCartView || isWishlistView || isCheckoutView || isAddressBookView || isOrdersView || isProductDetailView) {
+        if (isCartView || isWishlistView || isCheckoutView || isAddressBookView || isOrdersView || isProductDetailView || isPromoHuntView) {
             catalogToolbar.classList.add('hidden');
             collectionView.classList.add('hidden');
             activeFilters.classList.add('hidden');
@@ -14583,7 +15566,24 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function canAccessWorkspace(user = currentUser) {
-        return isStaffWorkspaceUser(user) || isManagerWorkspaceUser(user);
+        if (isStaffWorkspaceUser(user) || isManagerWorkspaceUser(user)) {
+            return true;
+        }
+
+        const identity = normalizeText([
+            user?.id,
+            user?.username,
+            user?.ten_dang_nhap,
+            user?.tenDangNhap,
+            user?.email
+        ].filter(Boolean).join(' '));
+
+        return identity.includes('user admin')
+            || identity.includes('user staff')
+            || identity === 'admin'
+            || identity.startsWith('admin ')
+            || identity.includes(' nhanvien')
+            || identity.includes(' staff');
     }
 
     function getWorkspaceRoleLabel(user = currentUser) {
@@ -15421,7 +16421,47 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         const storedItems = readStorage(cartStorageKey, []);
-        return Array.isArray(storedItems) ? storedItems : [];
+        if (!Array.isArray(storedItems)) {
+            return [];
+        }
+
+        const cartMap = new Map();
+
+        storedItems.forEach(rawItem => {
+            const productId = String(rawItem?.productId ?? rawItem?.id ?? '').trim();
+            if (!productId) {
+                return;
+            }
+
+            const product = findProductById(productId);
+            const sizeOptions = getProductSizeOptions(product);
+            const typeOptions = getProductTypeOptions(product);
+            const fallbackSize = sizeOptions[0] || 'Tieu chuan';
+            const size = String(rawItem?.size || fallbackSize).trim() || fallbackSize;
+            const fallbackVariantType = typeOptions.length ? typeOptions[0] : '';
+            const variantType = String(rawItem?.variantType || rawItem?.type || fallbackVariantType).trim();
+            const lineId = buildCartLineId(productId, size, variantType);
+            const quantity = Math.max(1, Math.round(Number(rawItem?.quantity || 1)));
+            const selected = normalizeCartSelectionFlag(rawItem?.selected);
+
+            if (cartMap.has(lineId)) {
+                const existing = cartMap.get(lineId);
+                existing.quantity += quantity;
+                existing.selected = normalizeCartSelectionFlag(existing.selected) && selected;
+                return;
+            }
+
+            cartMap.set(lineId, {
+                lineId,
+                productId,
+                size,
+                variantType,
+                quantity,
+                selected
+            });
+        });
+
+        return Array.from(cartMap.values());
     }
 
     function getWishlistIds() {
@@ -16172,6 +17212,11 @@ document.addEventListener('DOMContentLoaded', () => {
         adminPanel.classList.toggle('hidden', currentView !== 'workspace' || !workspaceUser);
         syncCommerceAccessUI();
         syncSupportChatVisibility();
+        if (currentView === 'promo-hunt') {
+            renderPromoHuntView();
+            void syncPromoHuntCampaignsFromApi({ render: true });
+            syncNavState();
+        }
         repairRenderedContent();
     }
 

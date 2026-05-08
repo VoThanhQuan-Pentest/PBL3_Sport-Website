@@ -16,6 +16,7 @@ services:
       - ./db-init/analytics_schema.sql:/docker-entrypoint-initdb.d/03-analytics-schema.sql:ro
       - ./db-init/support_chat_schema.sql:/docker-entrypoint-initdb.d/04-support-chat.sql:ro
       - ./db-init/password_reset_to_username.sql:/docker-entrypoint-initdb.d/05-password-reset.sql:ro
+      - ./db-init/promo_hunt_schema.sql:/docker-entrypoint-initdb.d/06-promo-hunt.sql:ro
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot123"]
       interval: 10s
