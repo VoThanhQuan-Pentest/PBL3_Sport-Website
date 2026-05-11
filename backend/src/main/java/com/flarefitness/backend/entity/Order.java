@@ -24,6 +24,15 @@ public class Order extends BaseEntity {
     @Column(name = "customer_id", nullable = false, length = 64)
     private String customerId;
 
+    @Column(name = "user_id", length = 64)
+    private String userId;
+
+    @Column(name = "nguoi_nhan", length = 150)
+    private String nguoiNhan;
+
+    @Column(name = "so_dien_thoai_giao", length = 30)
+    private String soDienThoaiGiao;
+
     @Column(name = "trang_thai_don", nullable = false, length = 50)
     private String trangThaiDon;
 
@@ -78,6 +87,30 @@ public class Order extends BaseEntity {
 
     public void setCustomerId(String customerId) {
         this.customerId = customerId;
+    }
+
+    public String getUserId() {
+        return userId;
+    }
+
+    public void setUserId(String userId) {
+        this.userId = userId;
+    }
+
+    public String getNguoiNhan() {
+        return nguoiNhan;
+    }
+
+    public void setNguoiNhan(String nguoiNhan) {
+        this.nguoiNhan = nguoiNhan;
+    }
+
+    public String getSoDienThoaiGiao() {
+        return soDienThoaiGiao;
+    }
+
+    public void setSoDienThoaiGiao(String soDienThoaiGiao) {
+        this.soDienThoaiGiao = soDienThoaiGiao;
     }
 
     public String getTrangThaiDon() {

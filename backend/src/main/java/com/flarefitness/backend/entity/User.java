@@ -28,6 +28,12 @@ public class User extends BaseEntity {
     @Column(name = "email", length = 150)
     private String email;
 
+    @Column(name = "trang_thai", nullable = false, length = 30)
+    private String status;
+
+    @Column(name = "is_deleted", nullable = false)
+    private Boolean deleted = false;
+
     public String getId() {
         return id;
     }
@@ -74,5 +80,21 @@ public class User extends BaseEntity {
 
     public void setEmail(String email) {
         this.email = email;
+    }
+
+    public String getStatus() {
+        return status;
+    }
+
+    public void setStatus(String status) {
+        this.status = status;
+    }
+
+    public Boolean getDeleted() {
+        return deleted;
+    }
+
+    public void setDeleted(Boolean deleted) {
+        this.deleted = deleted;
     }
 }

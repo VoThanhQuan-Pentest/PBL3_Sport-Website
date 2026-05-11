@@ -666,6 +666,12 @@ document.addEventListener('DOMContentLoaded', () => {
     let promoHuntSyncPromise = null;
     let promoHuntBackendAvailable = true;
     let promoHuntManagerSyncedAt = 0;
+    let orderApiSyncPromise = null;
+    let orderApiSyncedAt = 0;
+    let orderApiBackendAvailable = true;
+    let reviewApiSyncPromise = null;
+    let reviewApiSyncedAt = 0;
+    let reviewApiBackendAvailable = true;
     let allProducts = [];
     let currentCollectionId = '';
     let currentCategory = 'all';
@@ -710,6 +716,7 @@ document.addEventListener('DOMContentLoaded', () => {
     let cartRecommendationSignature = '';
     let detailRecommendationSignature = '';
     let recommendationFetchPromises = new Map();
+    let syncWriteTimers = new Map();
     let adminBehaviorOverview = null;
     let adminBehaviorOverviewError = '';
     let trackedPageContext = {
@@ -728,6 +735,8 @@ document.addEventListener('DOMContentLoaded', () => {
         updateWishlistCount();
         await loadAdministrativeUnits();
         await restoreSession();
+        await syncAppStateFromApi();
+        await syncCurrentUserStateFromApi();
         updateAuthUI();
         await loadProducts();
     }
@@ -1247,6 +1256,15 @@ document.addEventListener('DOMContentLoaded', () => {
             openOrdersView();
         });
 
+        ordersList?.addEventListener('click', event => {
+            const reviewButton = event.target.closest('[data-review-product-id]');
+            if (!reviewButton) {
+                return;
+            }
+            event.preventDefault();
+            openProductDetailView(reviewButton.dataset.reviewProductId);
+        });
+
         addressBookBackBtn.addEventListener('click', showCatalogView);
         ordersBackBtn.addEventListener('click', showCatalogView);
         addAddressBtn.addEventListener('click', () => openAddressForm());
@@ -1314,6 +1332,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 applyLoginSession(response);
                 closeOverlay(loginOverlay);
                 loginForm.reset();
+                await syncCurrentUserStateFromApi();
                 updateAuthUI();
                 await loadProducts();
                 await promptCustomerAddressIfMissing();
@@ -1416,6 +1435,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 registerForm.reset();
                 registerOtpForm.reset();
                 pendingRegisterPayload = null;
+                await syncCurrentUserStateFromApi();
                 updateAuthUI();
                 await loadProducts();
                 alert('Đăng ký thành công. Vui lòng thêm địa chỉ giao hàng cho tài khoản mới.');
@@ -1717,7 +1737,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         productDetailReviewForm?.addEventListener('submit', event => {
             event.preventDefault();
-            submitProductReview();
+            void submitProductReview();
         });
 
         wishlistGrid.addEventListener('click', event => {
@@ -2790,6 +2810,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function setHomeShowcaseEnabled(visible) {
         localStorage.setItem(HOME_SHOWCASE_STORAGE_KEY, visible ? 'true' : 'false');
+        if (canAccessWorkspace()) {
+            pushAppSyncState('home-showcase-visible', Boolean(visible));
+        }
     }
 
     function getHomeShowcaseVisibleCount() {
@@ -4680,6 +4703,208 @@ document.addEventListener('DOMContentLoaded', () => {
         return data;
     }
 
+    function parseSyncPayload(response, fallback = null) {
+        if (!response || typeof response.payload !== 'string') {
+            return fallback;
+        }
+        const parsed = safeJsonParse(response.payload);
+        return parsed === null ? fallback : parsed;
+    }
+
+    function scheduleSyncStatePush(scope, key, value, options = {}) {
+        const auth = options.auth !== false;
+        if (auth && !token) {
+            return;
+        }
+
+        const timerKey = `${scope}:${key}`;
+        if (syncWriteTimers.has(timerKey)) {
+            window.clearTimeout(syncWriteTimers.get(timerKey));
+        }
+
+        syncWriteTimers.set(timerKey, window.setTimeout(async () => {
+            syncWriteTimers.delete(timerKey);
+            try {
+                await apiRequest(`/sync/${scope}/${key}`, {
+                    method: 'PUT',
+                    auth,
+                    body: {
+                        payload: JSON.stringify(value ?? null)
+                    }
+                });
+            } catch (error) {
+                console.warn(`Sync ${timerKey} failed`, error);
+            }
+        }, options.delay ?? 350));
+    }
+
+    function pushCurrentUserSyncState(key, value) {
+        if (!currentUser || canAccessWorkspace()) {
+            return;
+        }
+        scheduleSyncStatePush('me', key, value);
+    }
+
+    function pushAppSyncState(key, value, options = {}) {
+        scheduleSyncStatePush('app', key, value, options);
+    }
+
+    async function syncScopedArrayFromApi(syncKey, storageKey, fallback = []) {
+        if (!currentUser || canAccessWorkspace() || !storageKey) {
+            return false;
+        }
+
+        try {
+            const response = await apiRequest(`/sync/me/${syncKey}`);
+            const remoteValue = parseSyncPayload(response, null);
+            if (Array.isArray(remoteValue)) {
+                if (remoteValue.length) {
+                    localStorage.setItem(storageKey, JSON.stringify(remoteValue));
+                } else {
+                    localStorage.removeItem(storageKey);
+                }
+                return true;
+            }
+
+            const localRaw = localStorage.getItem(storageKey);
+            if (localRaw !== null) {
+                const localValue = readStorage(storageKey, fallback);
+                scheduleSyncStatePush('me', syncKey, Array.isArray(localValue) ? localValue : fallback, { delay: 0 });
+            }
+        } catch (error) {
+            console.warn(`Pull ${syncKey} failed`, error);
+        }
+        return false;
+    }
+
+    async function syncCurrentVoucherAssignmentsFromApi() {
+        if (!currentUser || canAccessWorkspace()) {
+            return false;
+        }
+        const accountKey = getVoucherAssignmentAccountKey();
+        if (!accountKey) {
+            return false;
+        }
+
+        try {
+            const response = await apiRequest('/sync/me/voucher-assignments');
+            const remoteEntry = parseSyncPayload(response, null);
+            if (remoteEntry && typeof remoteEntry === 'object' && !Array.isArray(remoteEntry)) {
+                const store = getVoucherAssignmentStore();
+                store[accountKey] = normalizeVoucherAssignmentEntry(remoteEntry, accountKey);
+                localStorage.setItem(VOUCHER_ASSIGNMENTS_KEY, JSON.stringify(store));
+                localStorage.setItem(VOUCHER_ASSIGNMENTS_VERSION_KEY, VOUCHER_ASSIGNMENTS_VERSION);
+                return true;
+            }
+
+            const localEntry = getVoucherAssignmentStore()[accountKey];
+            if (localEntry) {
+                scheduleSyncStatePush('me', 'voucher-assignments', localEntry, { delay: 0 });
+            }
+        } catch (error) {
+            console.warn('Pull voucher assignments failed', error);
+        }
+        return false;
+    }
+
+    async function syncCurrentUserStateFromApi(options = {}) {
+        if (!currentUser || canAccessWorkspace()) {
+            return;
+        }
+
+        const changed = await Promise.all([
+            syncScopedArrayFromApi('cart', getCurrentCartStorageKey(), []),
+            syncScopedArrayFromApi('wishlist', getCurrentWishlistStorageKey(), []),
+            syncScopedArrayFromApi('address-book', getCurrentAddressBookStorageKey(), []),
+            syncScopedArrayFromApi('search-history', getSearchHistoryStorageKey(), []),
+            syncCurrentVoucherAssignmentsFromApi()
+        ]);
+
+        updateCartCount();
+        updateWishlistCount();
+        if (options.render && changed.some(Boolean)) {
+            if (currentView === 'cart') {
+                renderCartView();
+            } else if (currentView === 'wishlist') {
+                renderWishlistView();
+            } else if (currentView === 'address-book') {
+                renderAddressBookView();
+            }
+            syncMainView();
+        }
+    }
+
+    async function syncAppStateFromApi(options = {}) {
+        const mappings = [
+            {
+                key: 'home-showcase-visible',
+                apply(value) {
+                    if (typeof value === 'boolean') {
+                        const nextValue = value ? 'true' : 'false';
+                        if (localStorage.getItem(HOME_SHOWCASE_STORAGE_KEY) !== nextValue) {
+                            localStorage.setItem(HOME_SHOWCASE_STORAGE_KEY, nextValue);
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+            },
+            {
+                key: 'category-registry',
+                apply(value) {
+                    if (value && typeof value === 'object' && !Array.isArray(value)) {
+                        const nextValue = JSON.stringify(value);
+                        if (localStorage.getItem('pbl3_category_registry') !== nextValue) {
+                            localStorage.setItem('pbl3_category_registry', nextValue);
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+            },
+            {
+                key: 'managed-reviews',
+                apply(value) {
+                    // Reviews now sync through /api/reviews. Keep this key readable for older data,
+                    // but do not let stale app-state overwrite backend review state.
+                    return false;
+                }
+            },
+            {
+                key: 'managed-vouchers',
+                apply(value) {
+                    if (Array.isArray(value)) {
+                        const nextValue = JSON.stringify(value);
+                        if (localStorage.getItem(MANAGED_VOUCHERS_KEY) !== nextValue) {
+                            localStorage.setItem(MANAGED_VOUCHERS_KEY, nextValue);
+                            localStorage.setItem(MANAGED_VOUCHERS_VERSION_KEY, MANAGED_VOUCHERS_VERSION);
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+            }
+        ];
+
+        let changed = false;
+        await Promise.all(mappings.map(async mapping => {
+            try {
+                const response = await apiRequest(`/sync/app/${mapping.key}`, { auth: false });
+                changed = mapping.apply(parseSyncPayload(response, null)) || changed;
+            } catch (error) {
+                console.warn(`Pull app ${mapping.key} failed`, error);
+            }
+        }));
+
+        if (options.render && changed) {
+            renderCatalog();
+            renderInternalWorkspace();
+            if (currentView === 'product-detail') {
+                renderProductDetailView();
+            }
+        }
+    }
+
     function normalizeText(value) {
         return decodeMojibake(value)
             .replaceAll('Đ', 'D')
@@ -5168,11 +5393,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
         if (!normalizedIds.length) {
             localStorage.removeItem(wishlistStorageKey);
+            pushCurrentUserSyncState('wishlist', []);
             updateWishlistCount();
             return;
         }
 
         localStorage.setItem(wishlistStorageKey, JSON.stringify(normalizedIds));
+        pushCurrentUserSyncState('wishlist', normalizedIds);
         updateWishlistCount();
     }
 
@@ -5259,6 +5486,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         localStorage.setItem(storageKey, JSON.stringify(normalizedAddresses));
+        pushCurrentUserSyncState('address-book', normalizedAddresses);
     }
 
     function getDefaultAddress() {
@@ -6252,6 +6480,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         if (!Array.isArray(items) || !items.length) {
             localStorage.removeItem(cartStorageKey);
+            pushCurrentUserSyncState('cart', []);
             updateCartCount();
             return;
         }
@@ -6265,6 +6494,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }));
 
         localStorage.setItem(cartStorageKey, JSON.stringify(normalizedItems));
+        pushCurrentUserSyncState('cart', normalizedItems);
         updateCartCount();
     }
 
@@ -7202,7 +7432,7 @@ document.addEventListener('DOMContentLoaded', () => {
         openCheckoutView();
     }
 
-    function placeOrder() {
+    async function placeOrder() {
         const selectedItems = getHydratedCartItems().filter(item => item.selected);
         if (!selectedItems.length) {
             alert('Không có sản phẩm nào để thanh toán.');
@@ -7519,7 +7749,10 @@ document.addEventListener('DOMContentLoaded', () => {
                                     <h4 title="${escapeHtml(item.name || '')}">${escapeHtml(item.name || '')}</h4>
                                     <p>${escapeHtml(item.sku || '')} · Size ${escapeHtml(item.size || 'Tiêu chuẩn')} · SL ${Number(item.quantity || 0)}</p>
                                 </div>
-                                <strong>${formatCurrency(Number(item.subtotal || 0))}</strong>
+                                <div class="order-item-actions">
+                                    <strong>${formatCurrency(Number(item.subtotal || 0))}</strong>
+                                    ${isDeliveredOrder(order) ? `<button class="secondary-btn text-bold" type="button" data-review-product-id="${escapeHtml(item.productId || '')}">\u0110\u00e1nh gi\u00e1</button>` : ''}
+                                </div>
                             </div>
                         `).join('')}
                     </div>
@@ -7568,6 +7801,11 @@ document.addEventListener('DOMContentLoaded', () => {
         setTrackedPageContext('ORDERS', 'orders');
         renderOrdersView();
         syncMainView();
+        void syncOrdersFromApi(true).then(() => {
+            if (currentView === 'orders') {
+                renderOrdersView();
+            }
+        });
         window.scrollTo({ top: 0, behavior: 'smooth' });
     }
 
@@ -7644,7 +7882,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
-    function placeOrder() {
+    async function placeOrder() {
         const selectedItems = getHydratedCartItems().filter(item => item.selected);
         if (!selectedItems.length) {
             alert('Không có sản phẩm nào để thanh toán.');
@@ -8450,22 +8688,25 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function normalizeWorkspaceOrder(order, meta = {}) {
         const customer = order?.customer || meta.customer || {};
-        const accountKey = String(order?.accountKey || meta.accountKey || getAccountKeyForUser(customer) || '').trim();
+        const accountKey = String(order?.accountKey || order?.account_key || meta.accountKey || getAccountKeyForUser(customer) || '').trim();
         const accountKeyAliases = [
             accountKey,
             order?.accountKey,
+            order?.account_key,
             meta.accountKey,
-            ...(Array.isArray(order?.accountKeyAliases) ? order.accountKeyAliases : [])
+            ...(Array.isArray(order?.accountKeyAliases) ? order.accountKeyAliases : []),
+            ...(Array.isArray(order?.account_key_aliases) ? order.account_key_aliases : [])
         ].map(value => String(value || '').trim()).filter(Boolean);
         const normalizedItems = Array.isArray(order?.items)
             ? order.items.map(item => ({
-                productId: String(item?.productId || ''),
+                productId: String(item?.productId || item?.product_id || ''),
                 sku: String(item?.sku || ''),
                 name: String(item?.name || ''),
                 image: String(item?.image || ''),
                 size: String(item?.size || 'Tiêu chuẩn'),
+                variantType: String(item?.variantType || item?.variant_type || ''),
                 quantity: Number(item?.quantity || 0),
-                unitPrice: Number(item?.unitPrice || 0),
+                unitPrice: Number(item?.unitPrice || item?.unit_price || 0),
                 subtotal: Number(item?.subtotal || 0)
             }))
             : [];
@@ -8473,21 +8714,21 @@ document.addEventListener('DOMContentLoaded', () => {
         return {
             id: String(order?.id || generateRecordId('order')),
             code: String(order?.code || buildOrderCode()),
-            createdAt: order?.createdAt || new Date().toISOString(),
+            createdAt: order?.createdAt || order?.created_at || new Date().toISOString(),
             status: String(order?.status || 'Chờ xác nhận'),
-            paymentStatus: String(order?.paymentStatus || PAYMENT_STATUS_PENDING_COD),
-            paidAt: String(order?.paidAt || ''),
-            paymentConfirmedBy: String(order?.paymentConfirmedBy || ''),
-            supportRequest: String(order?.supportRequest || ''),
-            supportStatus: String(order?.supportStatus || ''),
-            supportNote: String(order?.supportNote || ''),
-            totalItems: Number(order?.totalItems || normalizedItems.reduce((sum, item) => sum + Number(item.quantity || 0), 0)),
+            paymentStatus: String(order?.paymentStatus || order?.payment_status || PAYMENT_STATUS_PENDING_COD),
+            paidAt: String(order?.paidAt || order?.paid_at || ''),
+            paymentConfirmedBy: String(order?.paymentConfirmedBy || order?.payment_confirmed_by || ''),
+            supportRequest: String(order?.supportRequest || order?.support_request || ''),
+            supportStatus: String(order?.supportStatus || order?.support_status || ''),
+            supportNote: String(order?.supportNote || order?.support_note || ''),
+            totalItems: Number(order?.totalItems || order?.total_items || normalizedItems.reduce((sum, item) => sum + Number(item.quantity || 0), 0)),
             subtotal: Number(order?.subtotal || 0),
             shipping: Number(order?.shipping || 0),
             discount: Number(order?.discount || 0),
             total: Number(order?.total || 0),
-            voucherCode: String(order?.voucherCode || ''),
-            voucherLabel: String(order?.voucherLabel || ''),
+            voucherCode: String(order?.voucherCode || order?.voucher_code || ''),
+            voucherLabel: String(order?.voucherLabel || order?.voucher_label || ''),
             address: order?.address || {},
             customer: {
                 id: customer?.id || '',
@@ -8659,10 +8900,30 @@ document.addEventListener('DOMContentLoaded', () => {
         };
     }
 
-    function updateWorkspaceOrder(orderId, patch = {}) {
+    async function updateWorkspaceOrder(orderId, patch = {}) {
+        const normalizedOrderId = String(orderId || '').trim();
+        if (!normalizedOrderId) {
+            return null;
+        }
+
+        if (canAccessWorkspace() && shouldSyncOrdersWithApi()) {
+            const remoteOrder = await updateOrderToApi(normalizedOrderId, patch);
+            if (!remoteOrder) {
+                showCenteredMessage('Không thể cập nhật đơn hàng. Dữ liệu sẽ được tải lại từ máy chủ.', 'error');
+                await syncOrdersFromApi(true);
+            }
+            if (currentView === 'workspace') {
+                renderInternalWorkspace();
+            }
+            if (currentView === 'orders') {
+                renderOrdersView();
+            }
+            return remoteOrder;
+        }
+
         const orders = getWorkspaceOrders();
         const nextOrders = orders.map(order => (
-            String(order.id) === String(orderId)
+            String(order.id) === normalizedOrderId
                 ? normalizeWorkspaceOrder({
                     ...order,
                     ...patch,
@@ -8673,7 +8934,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 : order
         ));
         saveWorkspaceOrders(nextOrders);
-        const updatedOrder = nextOrders.find(order => String(order.id) === String(orderId));
+        const updatedOrder = nextOrders.find(order => String(order.id) === normalizedOrderId);
         if (updatedOrder) {
             syncWorkspaceOrderToScopedHistory(updatedOrder);
         }
@@ -8681,6 +8942,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (currentView === 'orders') {
             renderOrdersView();
         }
+        return updatedOrder || null;
     }
 
     function getOrderHistory() {
@@ -8738,6 +9000,177 @@ document.addEventListener('DOMContentLoaded', () => {
         normalizedOrders.forEach(order => upsertWorkspaceOrder(order));
     }
 
+    function normalizeOrderStatusForApi(status) {
+        const normalized = normalizeText(status || '');
+        if (normalized.includes('da giao')) {
+            return '\u0110\u00e3 giao';
+        }
+        if (normalized.includes('dang giao')) {
+            return '\u0110ang giao';
+        }
+        if (normalized.includes('dang chuan bi') || normalized.includes('chuan bi')) {
+            return '\u0110ang chu\u1ea9n b\u1ecb';
+        }
+        if (normalized.includes('da huy') || normalized.includes('huy')) {
+            return '\u0110\u00e3 h\u1ee7y';
+        }
+        return 'Ch\u1edd x\u00e1c nh\u1eadn';
+    }
+
+    function shouldSyncOrdersWithApi() {
+        return Boolean(token && currentUser);
+    }
+
+    function mergeRemoteOrdersIntoLocal(orders = []) {
+        if (!Array.isArray(orders)) {
+            return [];
+        }
+
+        const mergedOrders = orders.map(order => normalizeWorkspaceOrder(order));
+        mergedOrders.forEach(order => upsertWorkspaceOrder(order));
+        return mergedOrders;
+    }
+
+    async function backfillLocalOrdersToApi(remoteOrders = []) {
+        if (!shouldSyncOrdersWithApi() || canAccessWorkspace()) {
+            return;
+        }
+
+        const storageKey = getCurrentOrderHistoryStorageKey();
+        const localOrders = readStorage(storageKey, []);
+        if (!Array.isArray(localOrders) || !localOrders.length) {
+            return;
+        }
+
+        const remoteIds = new Set(remoteOrders.map(order => String(order.id || '')));
+        const remoteCodes = new Set(remoteOrders.map(order => String(order.code || '')));
+        const pendingOrders = localOrders
+            .map(order => normalizeWorkspaceOrder(order, {
+                accountKey: getCurrentAccountStorageSuffix(),
+                customer: getCurrentCustomerProfile()
+            }))
+            .filter(order => !String(order.id || '').startsWith('sample-order'))
+            .filter(order => Array.isArray(order.items) && order.items.length)
+            .filter(order => !remoteIds.has(String(order.id || '')) && !remoteCodes.has(String(order.code || '')));
+
+        for (const order of pendingOrders) {
+            await createOrderToApi(order);
+        }
+    }
+
+    async function syncOrdersFromApi(force = false) {
+        if (!shouldSyncOrdersWithApi()) {
+            return [];
+        }
+        if (orderApiSyncPromise) {
+            return orderApiSyncPromise;
+        }
+        if (!force && Date.now() - orderApiSyncedAt < 5000) {
+            return [];
+        }
+
+        const path = canAccessWorkspace() ? '/orders' : '/orders/me';
+        orderApiSyncPromise = apiRequest(path)
+            .then(orders => {
+                orderApiBackendAvailable = true;
+                orderApiSyncedAt = Date.now();
+                const remoteOrders = mergeRemoteOrdersIntoLocal(orders);
+                void backfillLocalOrdersToApi(remoteOrders);
+                return remoteOrders;
+            })
+            .catch(error => {
+                orderApiBackendAvailable = false;
+                console.warn('Order API sync failed:', error);
+                return [];
+            })
+            .finally(() => {
+                orderApiSyncPromise = null;
+            });
+
+        return orderApiSyncPromise;
+    }
+
+    async function refreshOrderViewsFromApi(force = false) {
+        if (!shouldSyncOrdersWithApi() || !['orders', 'workspace', 'product-detail'].includes(currentView)) {
+            return [];
+        }
+
+        const remoteOrders = await syncOrdersFromApi(force);
+        if (!remoteOrders.length) {
+            return remoteOrders;
+        }
+
+        if (currentView === 'orders') {
+            renderOrdersView();
+        } else if (currentView === 'workspace') {
+            renderInternalWorkspace();
+        } else if (currentView === 'product-detail') {
+            renderProductDetailView();
+        }
+
+        return remoteOrders;
+    }
+
+    async function createOrderToApi(order) {
+        if (!shouldSyncOrdersWithApi() || canAccessWorkspace()) {
+            return null;
+        }
+
+        try {
+            const remoteOrder = await apiRequest('/orders', {
+                method: 'POST',
+                body: order
+            });
+            mergeRemoteOrdersIntoLocal([remoteOrder]);
+            return remoteOrder;
+        } catch (error) {
+            orderApiBackendAvailable = false;
+            console.warn('Create order API failed:', error);
+            return null;
+        }
+    }
+
+    async function updateOrderToApi(orderId, patch = {}) {
+        if (!shouldSyncOrdersWithApi() || !canAccessWorkspace()) {
+            return null;
+        }
+
+        const body = { ...patch };
+        if (Object.prototype.hasOwnProperty.call(body, 'status')) {
+            body.status = normalizeOrderStatusForApi(body.status);
+        }
+
+        try {
+            const remoteOrder = await apiRequest(`/orders/${encodeURIComponent(orderId)}`, {
+                method: 'PATCH',
+                body
+            });
+            mergeRemoteOrdersIntoLocal([remoteOrder]);
+            return remoteOrder;
+        } catch (error) {
+            orderApiBackendAvailable = false;
+            console.warn('Update order API failed:', error);
+            return null;
+        }
+    }
+
+    function isDeliveredOrder(order = {}) {
+        return normalizeText(order.status || '').includes('da giao');
+    }
+
+    function hasDeliveredOrderForProduct(productId) {
+        const targetProductId = String(productId || '');
+        if (!targetProductId || !currentUser || canAccessWorkspace()) {
+            return false;
+        }
+
+        return getOrderHistory().some(order => (
+            isDeliveredOrder(order)
+            && Array.isArray(order.items)
+            && order.items.some(item => String(item.productId || '') === targetProductId)
+        ));
+    }
+
     function getAccountRegistryStore() {
         const raw = readStorage('pbl3_account_registry', null);
         return {
@@ -8763,12 +9196,13 @@ document.addEventListener('DOMContentLoaded', () => {
         const normalizedRole = getCanonicalRole(account.role || account.vai_tro || 'Khách hàng');
         return {
             id: String(account.id || generateRecordId('account')),
-            ho_ten: String(account.ho_ten || account.name || '').trim(),
+            ho_ten: String(account.ho_ten || account.hoTen || account.name || '').trim(),
             username: String(account.username || account.ten_dang_nhap || '').trim(),
             email: String(account.email || '').trim(),
             sdt: String(account.sdt || account.so_dien_thoai || '').trim(),
             role: normalizedRole,
             status: String(account.status || account.trang_thai || 'Hoạt động').trim() || 'Hoạt động',
+            createdAt: String(account.createdAt || account.created_at || '').trim(),
             localOnly: Boolean(account.localOnly)
         };
     }
@@ -8788,8 +9222,11 @@ document.addEventListener('DOMContentLoaded', () => {
         try {
             const users = await apiRequest('/admin/users');
             state.managerBaseUsers = Array.isArray(users) ? users.map(user => normalizeAccountRecord(user)) : [];
+            state.managerAccountsFromApi = true;
+            localStorage.removeItem('pbl3_account_registry');
         } catch (error) {
             state.managerBaseUsers = Array.isArray(state.managerBaseUsers) ? state.managerBaseUsers : [];
+            state.managerAccountsFromApi = false;
         }
 
         state.managerBaseLoaded = true;
@@ -8799,6 +9236,15 @@ document.addEventListener('DOMContentLoaded', () => {
     function getManagedAccounts() {
         const state = getWorkspaceState();
         const baseAccounts = Array.isArray(state.managerBaseUsers) ? state.managerBaseUsers : [];
+        if (state.managerAccountsFromApi) {
+            return baseAccounts.map(account => normalizeAccountRecord(account)).sort((left, right) => {
+                const roleCompare = getWorkspaceRoleLabel(right).localeCompare(getWorkspaceRoleLabel(left), 'vi');
+                if (roleCompare !== 0) {
+                    return roleCompare;
+                }
+                return String(left.ho_ten || '').localeCompare(String(right.ho_ten || ''), 'vi');
+            });
+        }
         const registry = getAccountRegistryStore();
         const accountMap = new Map();
 
@@ -8896,10 +9342,12 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function saveManagedVoucherCatalog(vouchers) {
-        localStorage.setItem(MANAGED_VOUCHERS_KEY, JSON.stringify(
-            (Array.isArray(vouchers) ? vouchers : []).map((voucher, index) => normalizeVoucherRecord(voucher, index))
-        ));
+        const normalizedVouchers = (Array.isArray(vouchers) ? vouchers : []).map((voucher, index) => normalizeVoucherRecord(voucher, index));
+        localStorage.setItem(MANAGED_VOUCHERS_KEY, JSON.stringify(normalizedVouchers));
         localStorage.setItem(MANAGED_VOUCHERS_VERSION_KEY, MANAGED_VOUCHERS_VERSION);
+        if (canAccessWorkspace()) {
+            pushAppSyncState('managed-vouchers', normalizedVouchers);
+        }
     }
 
     function getVoucherCategories(voucher = {}) {
@@ -9074,6 +9522,12 @@ document.addEventListener('DOMContentLoaded', () => {
         }, {});
         localStorage.setItem(VOUCHER_ASSIGNMENTS_KEY, JSON.stringify(normalizedStore));
         localStorage.setItem(VOUCHER_ASSIGNMENTS_VERSION_KEY, VOUCHER_ASSIGNMENTS_VERSION);
+        if (currentUser && !canAccessWorkspace()) {
+            const accountKey = getVoucherAssignmentAccountKey();
+            if (accountKey && normalizedStore[accountKey]) {
+                pushCurrentUserSyncState('voucher-assignments', normalizedStore[accountKey]);
+            }
+        }
     }
 
     function getDefaultVoucherCodesForAccount(account = currentUser) {
@@ -9532,10 +9986,16 @@ document.addEventListener('DOMContentLoaded', () => {
 
             const serverUserClaimed = Boolean(campaign.userClaimed ?? campaign.user_claimed);
             const campaignClaims = getPromoHuntCampaignClaims(normalized.id);
-            if (serverUserClaimed && !campaignClaims[accountKey]) {
-                campaignClaims[accountKey] = new Date().toISOString();
-                claims[normalized.id] = campaignClaims;
-                changed = true;
+            if (serverUserClaimed) {
+                if (!campaignClaims[accountKey]) {
+                    campaignClaims[accountKey] = new Date().toISOString();
+                    claims[normalized.id] = campaignClaims;
+                    changed = true;
+                }
+                const currentEntry = normalizeVoucherAssignmentEntry(getVoucherAssignmentStore()[accountKey] || {}, accountKey);
+                if (normalized.voucherCode && !currentEntry.grants[normalized.voucherCode]) {
+                    assignVoucherToAccount(accountKey, normalized.voucherCode, 1);
+                }
             } else if (!serverUserClaimed && campaignClaims[accountKey]) {
                 delete campaignClaims[accountKey];
                 claims[normalized.id] = campaignClaims;
@@ -10043,11 +10503,15 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function saveCategoryRegistryStore(store) {
-        localStorage.setItem('pbl3_category_registry', JSON.stringify({
+        const normalizedStore = {
             created: Array.isArray(store?.created) ? store.created : [],
             updated: store?.updated && typeof store.updated === 'object' ? store.updated : {},
             deleted: Array.isArray(store?.deleted) ? store.deleted : []
-        }));
+        };
+        localStorage.setItem('pbl3_category_registry', JSON.stringify(normalizedStore));
+        if (canAccessWorkspace()) {
+            pushAppSyncState('category-registry', normalizedStore);
+        }
     }
 
     function getBaseCategoryRegistry() {
@@ -10102,7 +10566,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function buildSeedReviews() {
         return allProducts.slice(0, Math.min(8, allProducts.length)).map((product, index) => ({
-            id: generateRecordId('review'),
+            id: `seed-review-${product.id || index + 1}`,
             productId: String(product.id || ''),
             reviewer: `Khách ${index + 1}`,
             rating: 5 - (index % 2),
@@ -10112,17 +10576,142 @@ document.addEventListener('DOMContentLoaded', () => {
         }));
     }
 
+    function normalizeReviewRecord(review = {}) {
+        return {
+            id: String(review.id || generateRecordId('review')),
+            productId: String(review.productId || review.product_id || ''),
+            userId: String(review.userId || review.user_id || ''),
+            reviewer: sanitizeProductText(review.reviewer || review.reviewerName || review.reviewer_name || 'Khách hàng'),
+            rating: Math.min(5, Math.max(1, Number(review.rating || 5))),
+            content: sanitizeProductText(review.content || ''),
+            status: sanitizeProductText(review.status || 'Hiển thị'),
+            createdAt: review.createdAt || review.created_at || new Date().toISOString()
+        };
+    }
+
+    function setManagedReviewsLocal(reviews) {
+        localStorage.setItem('pbl3_managed_reviews', JSON.stringify(
+            (Array.isArray(reviews) ? reviews : []).map(normalizeReviewRecord)
+        ));
+    }
+
     function getManagedReviews() {
         const stored = readStorage('pbl3_managed_reviews', null);
-        const reviews = Array.isArray(stored) && stored.length ? stored : buildSeedReviews();
-        if (!Array.isArray(stored) || !stored.length) {
-            localStorage.setItem('pbl3_managed_reviews', JSON.stringify(reviews));
+        const reviews = Array.isArray(stored) ? stored.map(normalizeReviewRecord) : [];
+        if (!Array.isArray(stored)) {
+            setManagedReviewsLocal(reviews);
         }
         return reviews;
     }
 
     function saveManagedReviews(reviews) {
-        localStorage.setItem('pbl3_managed_reviews', JSON.stringify(Array.isArray(reviews) ? reviews : []));
+        const normalizedReviews = (Array.isArray(reviews) ? reviews : []).map(normalizeReviewRecord);
+        setManagedReviewsLocal(normalizedReviews);
+        if (canAccessWorkspace()) {
+            pushAppSyncState('managed-reviews', normalizedReviews);
+        }
+    }
+
+    function mergeManagedReviewsLocal(reviews) {
+        const reviewMap = new Map(getManagedReviews().map(review => [String(review.id), normalizeReviewRecord(review)]));
+        (Array.isArray(reviews) ? reviews : []).map(normalizeReviewRecord).forEach(review => {
+            if (review.id) {
+                reviewMap.set(String(review.id), review);
+            }
+        });
+        const mergedReviews = Array.from(reviewMap.values())
+            .sort((left, right) => new Date(right.createdAt || 0) - new Date(left.createdAt || 0));
+        setManagedReviewsLocal(mergedReviews);
+        return mergedReviews;
+    }
+
+    function replaceManagedReviewsFromApi(reviews) {
+        const normalizedReviews = (Array.isArray(reviews) ? reviews : []).map(normalizeReviewRecord);
+        setManagedReviewsLocal(normalizedReviews);
+        return normalizedReviews;
+    }
+
+    function replaceProductReviewsLocal(productId, reviews) {
+        const normalizedProductId = String(productId || '');
+        const remoteReviews = (Array.isArray(reviews) ? reviews : []).map(normalizeReviewRecord);
+        const nextReviews = [
+            ...remoteReviews,
+            ...getManagedReviews().filter(review => String(review.productId || '') !== normalizedProductId)
+        ].sort((left, right) => new Date(right.createdAt || 0) - new Date(left.createdAt || 0));
+        setManagedReviewsLocal(nextReviews);
+        return nextReviews;
+    }
+
+    async function syncReviewsFromApi(force = false) {
+        if (!canAccessWorkspace() || !token || (!reviewApiBackendAvailable && !force)) {
+            return [];
+        }
+        if (reviewApiSyncPromise) {
+            return reviewApiSyncPromise;
+        }
+        if (!force && Date.now() - reviewApiSyncedAt < 10000) {
+            return getManagedReviews();
+        }
+
+        reviewApiSyncPromise = apiRequest('/reviews')
+            .then(reviews => {
+                reviewApiBackendAvailable = true;
+                reviewApiSyncedAt = Date.now();
+                return replaceManagedReviewsFromApi(reviews);
+            })
+            .catch(error => {
+                reviewApiBackendAvailable = false;
+                console.warn('Khong the dong bo danh gia tu API:', error);
+                return getManagedReviews();
+            })
+            .finally(() => {
+                reviewApiSyncPromise = null;
+            });
+
+        return reviewApiSyncPromise;
+    }
+
+    async function syncProductReviewsFromApi(productId) {
+        if (!productId || !reviewApiBackendAvailable) {
+            return [];
+        }
+
+        try {
+            const reviews = await apiRequest(`/reviews/products/${encodeURIComponent(productId)}`, { auth: false });
+            reviewApiBackendAvailable = true;
+            return replaceProductReviewsLocal(productId, reviews);
+        } catch (error) {
+            reviewApiBackendAvailable = false;
+            console.warn('Khong the tai danh gia san pham:', error);
+            return getManagedReviews();
+        }
+    }
+
+    async function createReviewToApi(payload) {
+        if (!token) {
+            throw new Error('Vui lòng đăng nhập để gửi đánh giá.');
+        }
+        const createdReview = await apiRequest('/reviews', {
+            method: 'POST',
+            body: payload
+        });
+        reviewApiBackendAvailable = true;
+        return normalizeReviewRecord(createdReview);
+    }
+
+    async function updateReviewStatusToApi(reviewId, status) {
+        const updatedReview = await apiRequest(`/reviews/${encodeURIComponent(reviewId)}`, {
+            method: 'PATCH',
+            body: { status }
+        });
+        reviewApiBackendAvailable = true;
+        return normalizeReviewRecord(updatedReview);
+    }
+
+    async function deleteReviewToApi(reviewId) {
+        await apiRequest(`/reviews/${encodeURIComponent(reviewId)}`, { method: 'DELETE' });
+        reviewApiBackendAvailable = true;
+        return true;
     }
 
     function normalizeSupportThreadRecord(thread = {}) {
@@ -10727,6 +11316,13 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
+        const previousOrderSyncAt = orderApiSyncedAt;
+        void syncOrdersFromApi(false).then(remoteOrders => {
+            if (remoteOrders.length && orderApiSyncedAt !== previousOrderSyncAt && currentView === 'workspace' && getWorkspaceState().activeTab === 'orders-mgmt') {
+                renderStaffOrdersPanel();
+            }
+        });
+
         const state = getWorkspaceState();
         const allOrders = getWorkspaceOrders();
         const orders = filterStaffOrders(allOrders);
@@ -10830,6 +11426,13 @@ document.addEventListener('DOMContentLoaded', () => {
         const panel = document.getElementById('categories-mgmt-panel');
         if (!panel) {
             return;
+        }
+        if (canAccessWorkspace() && reviewApiBackendAvailable && Date.now() - reviewApiSyncedAt > 10000) {
+            void syncReviewsFromApi().then(() => {
+                if (document.getElementById('reviews-mgmt-panel')) {
+                    renderReviewsPanel();
+                }
+            });
         }
 
         const state = getWorkspaceState();
@@ -11184,7 +11787,7 @@ document.addEventListener('DOMContentLoaded', () => {
                                         <td><span class="workspace-chip">${escapeHtml(review.status || 'Hiển thị')}</span></td>
                                         <td>
                                             <div class="workspace-row-actions">
-                                                <button class="secondary-btn text-bold" type="button" data-review-action="toggle" data-review-id="${escapeHtml(review.id)}">${review.status === 'Hiển thị' ? 'Ẩn' : 'Hiển thị'}</button>
+                                                <button class="secondary-btn text-bold" type="button" data-review-action="toggle" data-review-id="${escapeHtml(review.id)}">${normalizeText(review.status || 'Hiển thị') === 'an' ? 'Hiển thị' : 'Ẩn'}</button>
                                                 <button class="cart-text-btn danger" type="button" data-review-action="delete" data-review-id="${escapeHtml(review.id)}">Xóa</button>
                                             </div>
                                         </td>
@@ -12251,7 +12854,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
-    function placeOrder() {
+    async function placeOrder() {
         const selectedItems = getHydratedCartItems().filter(item => item.selected);
         if (!selectedItems.length) {
             alert('Không có sản phẩm nào để thanh toán.');
@@ -12310,8 +12913,21 @@ document.addEventListener('DOMContentLoaded', () => {
             }))
         });
 
-        const existingOrders = getOrderHistory();
-        saveOrderHistory([nextOrder, ...existingOrders]);
+        if (placeOrderBtn) {
+            placeOrderBtn.disabled = true;
+        }
+
+        const remoteOrder = await createOrderToApi(nextOrder);
+        if (!remoteOrder) {
+            if (placeOrderBtn) {
+                placeOrderBtn.disabled = false;
+            }
+            showCenteredMessage('Không thể tạo đơn hàng trên hệ thống. Vui lòng kiểm tra kết nối backend rồi thử lại.', 'error');
+            return;
+        }
+
+        const existingOrders = getOrderHistory().filter(order => String(order.id) !== String(remoteOrder.id));
+        saveOrderHistory([remoteOrder, ...existingOrders]);
         if (appliedVoucher?.code) {
             consumeVoucherForCurrentAccount(appliedVoucher.code);
         }
@@ -12445,15 +13061,22 @@ document.addEventListener('DOMContentLoaded', () => {
         renderInternalWorkspace();
     }
 
-    function deleteManagedAccount(accountId) {
-        const registry = getAccountRegistryStore();
-        registry.created = registry.created.filter(account => String(account.id) !== String(accountId));
-        delete registry.updated[String(accountId)];
-        if (!registry.deleted.includes(String(accountId))) {
-            registry.deleted.push(String(accountId));
+    async function deleteManagedAccount(accountId) {
+        if (!accountId) {
+            return;
         }
-        saveAccountRegistryStore(registry);
-        renderInternalWorkspace();
+
+        try {
+            await apiRequest(`/admin/users/${encodeURIComponent(accountId)}`, { method: 'DELETE' });
+            localStorage.removeItem('pbl3_account_registry');
+            const state = getWorkspaceState();
+            state.managerBaseLoaded = false;
+            state.managerAccountsFromApi = false;
+            await ensureManagerAccountsLoaded(true);
+            renderInternalWorkspace();
+        } catch (error) {
+            alert(error?.message || 'Không thể xóa tài khoản. Vui lòng thử lại.');
+        }
     }
 
     function saveCategoryFromForm() {
@@ -12633,7 +13256,7 @@ document.addEventListener('DOMContentLoaded', () => {
             renderAdminProductList();
         });
 
-        adminPanel.addEventListener('click', event => {
+        adminPanel.addEventListener('click', async event => {
             const tabButton = event.target.closest('.tab-btn[data-role-scope]');
             if (tabButton) {
                 getWorkspaceState().activeWorkspaceTab = tabButton.dataset.tab || '';
@@ -12659,7 +13282,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     return;
                 }
                 if (accountButton.dataset.accountAction === 'delete' && confirm('Bạn có chắc muốn xóa tài khoản này không?')) {
-                    deleteManagedAccount(accountId);
+                    void deleteManagedAccount(accountId);
                     return;
                 }
             }
@@ -12675,11 +13298,11 @@ document.addEventListener('DOMContentLoaded', () => {
                 event.preventDefault();
                 const orderId = orderButton.dataset.orderId;
                 if (orderButton.dataset.orderAction === 'request-return') {
-                    updateWorkspaceOrder(orderId, { supportRequest: 'Yêu cầu đổi trả', supportStatus: 'Mới tạo' });
+                    void updateWorkspaceOrder(orderId, { supportRequest: 'Yêu cầu đổi trả', supportStatus: 'Mới tạo' });
                     return;
                 }
                 if (orderButton.dataset.orderAction === 'cancel-order') {
-                    updateWorkspaceOrder(orderId, { status: 'Đã hủy', supportRequest: 'Yêu cầu hủy đơn', supportStatus: 'Mới tạo' });
+                    void updateWorkspaceOrder(orderId, { status: 'Đã hủy', supportRequest: 'Yêu cầu hủy đơn', supportStatus: 'Mới tạo' });
                     return;
                 }
             }
@@ -12691,7 +13314,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     alert('Chỉ xác nhận thu tiền sau khi đơn hàng đã giao đến tay người nhận.');
                     return;
                 }
-                updateWorkspaceOrder(orderId, buildConfirmCodPaymentPatch());
+                void updateWorkspaceOrder(orderId, buildConfirmCodPaymentPatch());
                 return;
             }
 
@@ -12712,19 +13335,30 @@ document.addEventListener('DOMContentLoaded', () => {
             const reviewButton = event.target.closest('[data-review-action]');
             if (reviewButton) {
                 event.preventDefault();
-                const reviews = getManagedReviews();
-                const nextReviews = reviews
-                    .map(review => {
-                        if (String(review.id) !== String(reviewButton.dataset.reviewId)) {
-                            return review;
+                const reviewId = String(reviewButton.dataset.reviewId || '');
+                const action = reviewButton.dataset.reviewAction;
+                const review = getManagedReviews().find(item => String(item.id) === reviewId);
+                if (!reviewId || !review) {
+                    return;
+                }
+
+                try {
+                    if (action === 'toggle') {
+                        const nextStatus = normalizeText(review.status || 'Hiển thị') === 'an' ? 'Hiển thị' : 'Ẩn';
+                        const updatedReview = await updateReviewStatusToApi(reviewId, nextStatus);
+                        mergeManagedReviewsLocal([updatedReview]);
+                    }
+                    if (action === 'delete') {
+                        if (!confirm('Xóa đánh giá này khỏi hệ thống?')) {
+                            return;
                         }
-                        if (reviewButton.dataset.reviewAction === 'toggle') {
-                            return { ...review, status: review.status === 'Hiển thị' ? 'Ẩn' : 'Hiển thị' };
-                        }
-                        return review;
-                    })
-                    .filter(review => !(reviewButton.dataset.reviewAction === 'delete' && String(review.id) === String(reviewButton.dataset.reviewId)));
-                saveManagedReviews(nextReviews);
+                        await deleteReviewToApi(reviewId);
+                        setManagedReviewsLocal(getManagedReviews().filter(item => String(item.id) !== reviewId));
+                    }
+                } catch (error) {
+                    showCenteredMessage(error.message || 'Không thể cập nhật đánh giá.');
+                    return;
+                }
                 renderReviewsPanel();
                 return;
             }
@@ -12734,15 +13368,15 @@ document.addEventListener('DOMContentLoaded', () => {
                 event.preventDefault();
                 const orderId = returnButton.dataset.orderId;
                 if (returnButton.dataset.returnAction === 'processing') {
-                    updateWorkspaceOrder(orderId, { supportStatus: 'Đang xử lý' });
+                    void updateWorkspaceOrder(orderId, { supportStatus: 'Đang xử lý' });
                     return;
                 }
                 if (returnButton.dataset.returnAction === 'resolved') {
-                    updateWorkspaceOrder(orderId, { supportStatus: 'Hoàn tất', supportRequest: '' });
+                    void updateWorkspaceOrder(orderId, { supportStatus: 'Hoàn tất', supportRequest: '' });
                     return;
                 }
                 if (returnButton.dataset.returnAction === 'clear') {
-                    updateWorkspaceOrder(orderId, { supportRequest: '', supportStatus: '', supportNote: '' });
+                    void updateWorkspaceOrder(orderId, { supportRequest: '', supportStatus: '', supportNote: '' });
                     return;
                 }
             }
@@ -12970,7 +13604,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
             const statusSelect = event.target.closest('[data-order-status-select]');
             if (statusSelect) {
-                updateWorkspaceOrder(statusSelect.dataset.orderId, { status: statusSelect.value });
+                await updateWorkspaceOrder(statusSelect.dataset.orderId, { status: statusSelect.value });
                 return;
             }
 
@@ -12984,7 +13618,7 @@ document.addEventListener('DOMContentLoaded', () => {
         adminPanel.addEventListener('submit', async event => {
             if (event.target.id === 'account-form') {
                 event.preventDefault();
-                saveManagedAccountFromForm();
+                await saveManagedAccountFromForm();
                 return;
             }
 
@@ -14130,7 +14764,17 @@ document.addEventListener('DOMContentLoaded', () => {
             priceValue: getProductCurrentPrice(product)
         });
         renderProductDetailView();
+        void syncProductReviewsFromApi(product.id).then(() => {
+            if (currentView === 'product-detail' && String(currentDetailProductId) === String(product.id)) {
+                renderProductDetailView();
+            }
+        });
         void loadDetailRecommendations(product.id, true);
+        void syncOrdersFromApi(true).then(remoteOrders => {
+            if (remoteOrders.length && currentView === 'product-detail' && String(currentDetailProductId) === String(product.id)) {
+                renderProductDetailView();
+            }
+        });
         syncMainView();
         window.scrollTo({ top: 0, behavior: 'smooth' });
     }
@@ -14237,6 +14881,24 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         productDetailDescription.textContent = getProductDescription(product);
+        const canSubmitReview = hasDeliveredOrderForProduct(product.id);
+        if (productDetailReviewForm) {
+            productDetailReviewForm.querySelectorAll('select, textarea, button[type="submit"]').forEach(control => {
+                control.disabled = !canSubmitReview;
+            });
+            productDetailReviewForm.classList.toggle('review-form-disabled', !canSubmitReview);
+        }
+        if (productDetailReviewError) {
+            if (canSubmitReview) {
+                productDetailReviewError.textContent = '';
+                productDetailReviewError.classList.add('hidden');
+            } else {
+                productDetailReviewError.textContent = currentUser && !canAccessWorkspace()
+                    ? 'B\u1ea1n ch\u1ec9 c\u00f3 th\u1ec3 \u0111\u00e1nh gi\u00e1 sau khi \u0111\u01a1n h\u00e0ng ch\u1ee9a s\u1ea3n ph\u1ea9m n\u00e0y \u0111\u00e3 giao.'
+                    : '\u0110\u0103ng nh\u1eadp b\u1eb1ng t\u00e0i kho\u1ea3n kh\u00e1ch h\u00e0ng \u0111\u00e3 mua s\u1ea3n ph\u1ea9m \u0111\u1ec3 \u0111\u00e1nh gi\u00e1.';
+                productDetailReviewError.classList.remove('hidden');
+            }
+        }
         productDetailReviewCount.textContent = `${reviews.length} đánh giá`;
         productDetailReviews.innerHTML = reviews.map(review => `
             <article class="product-review-card">
@@ -15406,13 +16068,21 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
-    function submitProductReview() {
+    async function submitProductReview() {
         const product = findProductById(currentDetailProductId);
         if (!product) {
             return;
         }
 
         if (!ensureCustomerAccess('Hãy đăng nhập bằng tài khoản khách hàng để gửi đánh giá.')) {
+            return;
+        }
+
+        if (!hasDeliveredOrderForProduct(product.id)) {
+            if (productDetailReviewError) {
+                productDetailReviewError.textContent = 'B\u1ea1n ch\u1ec9 c\u00f3 th\u1ec3 \u0111\u00e1nh gi\u00e1 sau khi \u0111\u01a1n h\u00e0ng ch\u1ee9a s\u1ea3n ph\u1ea9m n\u00e0y \u0111\u00e3 giao.';
+                productDetailReviewError.classList.remove('hidden');
+            }
             return;
         }
 
@@ -15432,20 +16102,22 @@ document.addEventListener('DOMContentLoaded', () => {
             productDetailReviewError.classList.add('hidden');
         }
 
-        const nextReviews = [
-            {
-                id: generateRecordId('review'),
+        let createdReview;
+        try {
+            createdReview = await createReviewToApi({
                 productId: String(product.id),
-                reviewer: getUserDisplayName(currentUser) || 'Khách hàng',
                 rating: reviewRating,
-                content: reviewContent,
-                status: 'Hiển thị',
-                createdAt: new Date().toISOString()
-            },
-            ...getManagedReviews()
-        ];
+                content: reviewContent
+            });
+        } catch (error) {
+            if (productDetailReviewError) {
+                productDetailReviewError.textContent = error.message || 'Không thể gửi đánh giá lên hệ thống.';
+                productDetailReviewError.classList.remove('hidden');
+            }
+            return;
+        }
 
-        saveManagedReviews(nextReviews);
+        mergeManagedReviewsLocal([createdReview]);
         if (productDetailReviewContent) {
             productDetailReviewContent.value = '';
         }
@@ -16320,12 +16992,12 @@ document.addEventListener('DOMContentLoaded', () => {
         repairTextNodes(userListBody);
     };
 
-    saveManagedAccountFromForm = function saveManagedAccountFromForm() {
-        const registry = getAccountRegistryStore();
+    saveManagedAccountFromForm = async function saveManagedAccountFromForm() {
         const selectedRole = document.getElementById('account-role').value;
         const existingAccountId = document.getElementById('account-id').value.trim();
         const existingAccount = getManagedAccounts().find(account => String(account.id) === existingAccountId);
         const nextCreatedAt = document.getElementById('account-created-at').value.trim() || existingAccount?.createdAt || new Date().toISOString();
+        const password = document.getElementById('account-password')?.value.trim() || '';
         const payload = normalizeAccountRecord({
             id: existingAccountId || generateManagedAccountId(selectedRole),
             ho_ten: document.getElementById('account-name').value.trim(),
@@ -16347,19 +17019,45 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
-        const existsInBase = getManagedAccounts().some(account => String(account.id) === payload.id);
-        if (existsInBase) {
-            registry.updated[payload.id] = payload;
-        } else {
-            registry.created = [
-                ...registry.created.filter(account => String(account.id) !== payload.id),
-                payload
-            ];
+        const requestBody = {
+            hoTen: payload.ho_ten,
+            username: payload.username,
+            email: payload.email,
+            sdt: payload.sdt,
+            role: payload.role,
+            status: payload.status
+        };
+        if (password) {
+            requestBody.password = password;
         }
 
-        saveAccountRegistryStore(registry);
-        closeAccountForm();
-        renderInternalWorkspace();
+        const error = document.getElementById('account-form-error');
+        if (error) {
+            error.classList.add('hidden');
+            error.textContent = '';
+        }
+
+        try {
+            const requestPath = existingAccountId
+                ? `/admin/users/${encodeURIComponent(existingAccountId)}`
+                : '/admin/users';
+            await apiRequest(requestPath, {
+                method: existingAccountId ? 'PUT' : 'POST',
+                body: requestBody
+            });
+            localStorage.removeItem('pbl3_account_registry');
+            const state = getWorkspaceState();
+            state.managerBaseLoaded = false;
+            state.managerAccountsFromApi = false;
+            await ensureManagerAccountsLoaded(true);
+            closeAccountForm();
+            renderInternalWorkspace();
+        } catch (apiError) {
+            if (error) {
+                error.textContent = apiError?.message || 'Không thể lưu tài khoản. Vui lòng thử lại.';
+                error.classList.remove('hidden');
+            }
+        }
     };
 
     function ensureCartAccess(message = 'H\u00e3y \u0111\u0103ng nh\u1eadp \u0111\u1ec3 s\u1eed d\u1ee5ng gi\u1ecf h\u00e0ng.') {
@@ -16550,7 +17248,9 @@ document.addEventListener('DOMContentLoaded', () => {
             normalizedQueries.push(trimmedQuery);
         });
 
-        localStorage.setItem(storageKey, JSON.stringify(normalizedQueries.slice(0, 10)));
+        const nextQueries = normalizedQueries.slice(0, 10);
+        localStorage.setItem(storageKey, JSON.stringify(nextQueries));
+        pushCurrentUserSyncState('search-history', nextQueries);
     }
 
     function rememberSearchQuery(query) {
@@ -17459,6 +18159,23 @@ document.addEventListener('DOMContentLoaded', () => {
     initializeWorkspaceInteractions();
     window.addEventListener('beforeunload', () => {
         flushTrackedPageStay(true);
+    });
+    window.setInterval(() => {
+        void refreshOrderViewsFromApi(true);
+    }, 5000);
+    window.setInterval(() => {
+        void syncAppStateFromApi({ render: true });
+        void syncCurrentUserStateFromApi({ render: true });
+    }, 30000);
+    window.addEventListener('focus', () => {
+        void refreshOrderViewsFromApi(true);
+        void syncAppStateFromApi({ render: true });
+        void syncCurrentUserStateFromApi({ render: true });
+    });
+    document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) {
+            void refreshOrderViewsFromApi(true);
+        }
     });
     syncSupportChatVisibility();
 

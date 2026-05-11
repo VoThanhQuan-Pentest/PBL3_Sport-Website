@@ -81,6 +81,8 @@ public class AuthService {
         user.setRole(CUSTOMER_ROLE);
         user.setHoTen(request.hoTen().trim());
         user.setEmail(request.email().trim());
+        user.setStatus("Hoat dong");
+        user.setDeleted(false);
         user.setCreatedAt(LocalDateTime.now());
 
         userRepository.save(user);

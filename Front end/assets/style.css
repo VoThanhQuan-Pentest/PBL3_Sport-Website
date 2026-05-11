@@ -2373,6 +2373,17 @@ textarea {
     font-size: 22px;
 }
 
+.order-item-actions {
+    display: grid;
+    justify-items: end;
+    gap: 10px;
+}
+
+.order-item-actions .secondary-btn {
+    min-height: 40px;
+    padding: 0 16px;
+}
+
 .small-eyebrow {
     margin-bottom: 6px;
     font-size: 12px;
@@ -2845,6 +2856,16 @@ textarea {
     background: linear-gradient(180deg, #ffffff 0%, #f7faff 100%);
     border: 1px solid rgba(8, 44, 104, 0.08);
     box-shadow: 0 18px 42px rgba(8, 44, 104, 0.08);
+}
+
+.review-form-disabled {
+    opacity: 0.72;
+}
+
+.review-form-disabled select,
+.review-form-disabled textarea,
+.review-form-disabled button {
+    cursor: not-allowed;
 }
 
 .product-detail-description {

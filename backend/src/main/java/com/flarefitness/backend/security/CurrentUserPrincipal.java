@@ -53,7 +53,15 @@ public class CurrentUserPrincipal implements UserDetails {
 
     @Override
     public boolean isEnabled() {
-        return true;
+        if (Boolean.TRUE.equals(user.getDeleted())) {
+            return false;
+        }
+        String status = normalizeRole(user.getStatus());
+        return !status.contains("ngung")
+                && !status.contains("khoa")
+                && !status.contains("inactive")
+                && !status.contains("disabled")
+                && !status.contains("tam dung");
     }
 
     public static String toAuthority(String role) {
